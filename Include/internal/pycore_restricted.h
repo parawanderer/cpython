@@ -77,6 +77,16 @@ extern int _PyRestricted_CheckSetAttr(PyObject *obj, PyObject *name);
 extern int _PyRestricted_CheckItem(PyObject *obj, int write);
 extern int _PyRestricted_CheckImport(PyObject *name);
 extern int _PyRestricted_CheckCall(PyObject *callable);
+extern int _PyRestricted_IsLiftedLeaf(PyObject *callable);
+
+/* The interpreter pushes a Python function's frame inline, which never reaches the call gate: a function registered as
+   a LIFTED leaf (pandas Python) must take the gated path instead, or it would run as tier 3 (gated, and refused on its
+   own internals). */
+static inline int
+_PyRestricted_MustCallThroughGate(PyThreadState *tstate, PyObject *callable)
+{
+    return _PyRestricted_Active(tstate) && _PyRestricted_IsLiftedLeaf(callable);
+}
 extern PyObject *_PyRestricted_Vectorcall(PyThreadState *tstate, PyObject *callable, PyObject *const *args,
                                           size_t nargsf, PyObject *kwnames);
 extern PyObject *_PyRestricted_Call(PyThreadState *tstate, PyObject *callable, PyObject *args, PyObject *kwargs);
@@ -84,7 +94,9 @@ extern PyObject *_PyRestricted_Call(PyThreadState *tstate, PyObject *callable, P
 /* Registration, host-only (Modules/_restrictedmodule.c). */
 PyAPI_FUNC(int) _PyRestricted_AllowKind(PyObject *type, PyObject *names);
 PyAPI_FUNC(int) _PyRestricted_AllowModule(PyObject *name, PyObject *names);
-PyAPI_FUNC(int) _PyRestricted_AllowCall(PyObject *callable, int lift);
+PyAPI_FUNC(int) _PyRestricted_AllowCall(PyObject *callable, int lift, PyObject *checker);
+PyAPI_FUNC(int) _PyRestricted_AllowDynamic(PyObject *type, PyObject *predicate);
+extern int _PyRestricted_ReadAttrLifted(PyObject *obj, PyObject *name, PyObject **result);
 PyAPI_FUNC(void) _PyRestricted_SetException(PyObject *exc);
 PyAPI_FUNC(void) _PyRestricted_Reset(void);
 

@@ -140,12 +140,32 @@ restricted_allow_module(PyObject *module, PyObject *const *args, Py_ssize_t narg
 static PyObject *
 restricted_allow_call(PyObject *module, PyObject *const *args, Py_ssize_t nargs)
 {
-    if (nargs < 1 || nargs > 2) {
-        PyErr_SetString(PyExc_TypeError, "allow_call(callable, lift=True)");
+    if (nargs < 1 || nargs > 3) {
+        PyErr_SetString(PyExc_TypeError, "allow_call(callable, lift=False, checker=None)");
         return NULL;
     }
-    int lift = nargs == 2 ? PyObject_IsTrue(args[1]) : 0;
-    if (lift < 0 || _PyRestricted_AllowCall(args[0], lift) < 0) {
+    int lift = nargs >= 2 ? PyObject_IsTrue(args[1]) : 0;
+    PyObject *checker = nargs == 3 && args[2] != Py_None ? args[2] : NULL;
+    if (checker != NULL && !lift) {
+        PyErr_SetString(PyExc_ValueError, "an entry checker belongs to a lifted leaf");
+        return NULL;
+    }
+    if (lift < 0 || _PyRestricted_AllowCall(args[0], lift, checker) < 0) {
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
+/* allow_dynamic(type, predicate): for a name outside the type's table, predicate(obj, name), run lifted, may admit it;
+   the read is then lifted. Never consulted for a dunder or a listed name (a manifest's `dynamic: columns`). */
+static PyObject *
+restricted_allow_dynamic(PyObject *module, PyObject *const *args, Py_ssize_t nargs)
+{
+    if (nargs != 2 || !PyType_Check(args[0]) || !PyCallable_Check(args[1])) {
+        PyErr_SetString(PyExc_TypeError, "allow_dynamic(type, predicate)");
+        return NULL;
+    }
+    if (_PyRestricted_AllowDynamic(args[0], args[1]) < 0) {
         return NULL;
     }
     Py_RETURN_NONE;
@@ -165,7 +185,9 @@ static PyMethodDef restricted_methods[] = {
     {"allow_module", _PyCFunction_CAST(restricted_allow_module), METH_FASTCALL,
      "allow_module(name, names, /)\n--\n\nAllow importing name and reading these of its attributes."},
     {"allow_call", _PyCFunction_CAST(restricted_allow_call), METH_FASTCALL,
-     "allow_call(callable, lift=False, /)\n--\n\nAllow calling it from restricted code; lift=True only for a manifest leaf."},
+     "allow_call(callable, lift=False, checker=None, /)\n--\n\nAllow calling it from restricted code; lift=True only for a manifest leaf,\nwhose checker(func, self, args, kwargs) runs first."},
+    {"allow_dynamic", _PyCFunction_CAST(restricted_allow_dynamic), METH_FASTCALL,
+     "allow_dynamic(type, predicate, /)\n--\n\nAdmit names outside type's table when predicate(obj, name) is true."},
     {"reset", restricted_reset, METH_NOARGS,
      "reset()\n--\n\nForget every allow table."},
     {"run", _PyCFunction_CAST(restricted_run), METH_FASTCALL,

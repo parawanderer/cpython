@@ -121,14 +121,69 @@ def _top_targets(stmt):
 def run_cell(source, namespace, nodes=DEFAULT_NODES):
     """Check, compile and run a cell in ``namespace`` (a dict) with the thread restricted; return the cell's value."""
     _restricted.run(compile_cell(source, nodes=nodes), namespace)
+    namespace.pop("_user", None)
     return namespace.pop("__cell_result__", None)
 
 
-# Leaves that resolve a NAME they are given, or call a callable they are given, need an entry check before they may be
-# lifted (repl-specs 2026-10-15: a closed vocabulary for strings, only the program's own functions as callbacks). Until
-# that check exists they are registered UNLIFTED: gated, so they fail closed on pandas' own internals.
-_NEEDS_ENTRY_CHECK = {"agg", "aggregate", "apply", "transform", "map", "applymap", "pipe", "query", "eval",
-                      "sort_values", "groupby"}
+# Leaves that resolve a NAME they are given, or call a callable they are given: lifted only behind an ENTRY CHECK
+# (repl-specs 2026-10-15): every callable argument, walked into plain containers, must be the program's own restricted
+# function, and every string in a names position must be in the closed vocabulary. query and eval are out entirely.
+_ENTRY_CHECKED = {"agg", "aggregate", "apply", "transform", "map", "applymap", "pipe", "sort_values", "groupby"}
+_NAME_POSITION = {"agg", "aggregate", "apply", "transform"}     # resolve a method name from a string
+_OUT = {"query", "eval"}
+# The closed vocabulary, starting at the pandas reductions (ruled); the corpus passes only "sum".
+VOCABULARY = frozenset({"sum", "mean", "median", "min", "max", "count", "std", "var", "prod", "first", "last",
+                        "nunique", "size", "any", "all"})
+# Pure builtins every manifest starts from, beyond what the corpus count observed: none resolves a name from its
+# arguments (getattr, hasattr, eval and the like stay out, ruled).
+PURE_BUILTINS = ("abs", "all", "any", "bool", "chr", "dict", "divmod", "enumerate", "filter", "float", "frozenset",
+                 "int", "isinstance", "len", "list", "map", "max", "min", "ord", "pow", "print", "range", "repr",
+                 "reversed", "round", "set", "sorted", "str", "sum", "tuple", "type", "zip")
+
+
+def _plain(x):
+    return type(x) in (list, tuple, dict, set, frozenset)
+
+
+def _walk(x):
+    """x and, recursively, the elements of plain containers (never into an object such as a frame)."""
+    yield x
+    if type(x) is dict:
+        for v in x.values():
+            yield from _walk(v)
+    elif _plain(x):
+        for v in x:
+            yield from _walk(v)
+
+
+def own_function(f):
+    """The program's own function: a plain Python function whose code is CO_RESTRICTED (a lambda or def in a cell)."""
+    import types
+    return type(f) is types.FunctionType and bool(f.__code__.co_flags & CO_RESTRICTED)
+
+
+def entry_check(name, method):
+    """The checker for a lifted leaf named `name`: run before the leaf, with its arguments. For a METHOD the gate may
+    see the plain function with the receiver as the first argument (a method call's LOAD_ATTR hands CALL the unbound
+    function), so the receiver is dropped before the arguments are judged."""
+    names_position = name in _NAME_POSITION
+
+    def check(func, self, args, kwargs):
+        if method and self is None:
+            args = args[1:]
+        given = list(args) + list((kwargs or {}).values())
+        for i, a in enumerate(given):
+            for x in _walk(a):
+                if callable(x) and not isinstance(x, type) and not own_function(x):
+                    raise NotInDialect(f"not in dialect: {name}() is handed a callable that is not the program's own "
+                                       f"function ({type(x).__name__})")
+        if names_position:
+            head = list(args[:1]) + [v for k, v in (kwargs or {}).items() if k == "func"]
+            for a in head:
+                for x in _walk(a):
+                    if isinstance(x, str) and x not in VOCABULARY:
+                        raise NotInDialect(f"not in dialect: {name}({x!r}) names a method outside the vocabulary")
+    return check
 # Effects outside heap(owned): never lifted, never listed, until the manifest's effects pass says how.
 _EFFECTFUL = {"read_csv", "read_html", "read_json", "read_excel", "read_parquet", "read_pickle", "to_pickle",
               "to_csv", "to_parquet", "to_excel", "to_json", "to_html", "to_sql", "info"}
@@ -143,7 +198,7 @@ def load_manifests(data_dir):
     wl = data("whitelist.json")
     done = {"calls": [], "lifted": [], "kinds": {}, "modules": {}}
 
-    for name in wl["builtins"]:
+    for name in sorted(set(wl["builtins"]) | set(PURE_BUILTINS)):
         f = getattr(builtins, name, None)
         if f is not None and name not in wl["refused_builtins"]:
             _restricted.allow_call(f, False)
@@ -181,24 +236,29 @@ def load_manifests(data_dir):
         done["modules"][mod_name] = top
         for fname in top:
             f = getattr(mod, fname, None)
-            if f is not None and fname not in _NEEDS_ENTRY_CHECK:
-                _restricted.allow_call(f, True)
+            if f is not None and fname not in _OUT:
+                _restricted.allow_call(f, True, entry_check(fname, False) if fname in _ENTRY_CHECKED else None)
                 done["lifted"].append(f"{mod_name}.{fname}")
         for kind, names in man["kinds"].items():
             cls = _kind_class(mod_name, kind)
             if cls is None:
                 continue
-            listed = [n for n in names if n not in _EFFECTFUL]
+            listed = [n for n in names if n not in _EFFECTFUL and n not in _OUT]
+            if mod_name == "pandas":    # the checked leaves are listed whatever the corpus count's threshold said
+                listed += [n for n in sorted(_ENTRY_CHECKED) if n not in listed]
             extra = ["[]", "[]^"] if (mod_name, kind) in (("pandas", "DataFrame"), ("pandas", "Series")) else []
             for c in (cls if isinstance(cls, tuple) else (cls,)):
-                _restricted.allow_kind(c, listed + extra)
-                for n in listed:
-                    if n in _NEEDS_ENTRY_CHECK:
-                        continue
+                present = [n for n in listed if hasattr(c, n)]
+                _restricted.allow_kind(c, present + extra)
+                for n in present:
                     f = _static_function(c, n)
                     if f is not None:
-                        _restricted.allow_call(f, True)
+                        _restricted.allow_call(f, True, entry_check(n, True) if n in _ENTRY_CHECKED else None)
                         done["lifted"].append(f"{c.__name__}.{n}")
+            if (mod_name, kind) == ("pandas", "DataFrame"):
+                # dynamic: columns (ruled). Ours, not pandas' __getattr__; never a name the class itself has.
+                _restricted.allow_dynamic(cls, lambda obj, name, _cls=cls: isinstance(name, str)
+                                          and not hasattr(_cls, name) and name in obj.columns)
             done["kinds"][f"{mod_name}.{kind}"] = listed + extra
     return done
 
