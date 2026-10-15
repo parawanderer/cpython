@@ -152,6 +152,10 @@ struct PyCodeObject _PyCode_DEF(1);
 /* A function defined in class scope */
 #define CO_METHOD  0x8000000
 
+/* window.ml restricted mode: code compiled from a cell the read-only dialect admitted.
+   Set by restricted.compile() on the cell's code object and every code object nested in it. */
+#define CO_RESTRICTED  0x10000000
+
 /* This should be defined if a future statement modifies the syntax.
    For example, when a keyword is added.
 */

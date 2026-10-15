@@ -37,6 +37,14 @@ typedef struct _PyThreadStateImpl {
     uintptr_t c_stack_soft_limit;
     uintptr_t c_stack_hard_limit;
 
+    // window.ml restricted mode (Modules/_restrictedmodule.c). Internal, so the ABI is unchanged.
+    // restricted: set for the C extent of _restricted.run(); cleared while an approved C leaf runs (lifted).
+    // restricted_barrier: the frame current when the innermost lift began; a CO_RESTRICTED frame above it
+    // (a callback the leaf made) is restricted again.
+    int restricted;
+    int restricted_lifted;
+    struct _PyInterpreterFrame *restricted_barrier;
+
     PyObject *asyncio_running_loop; // Strong reference
     PyObject *asyncio_running_task; // Strong reference
 
