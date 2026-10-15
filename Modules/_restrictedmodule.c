@@ -105,7 +105,69 @@ restricted_build(PyObject *module, PyObject *Py_UNUSED(ignored))
                          "jit", jit ? Py_True : Py_False);
 }
 
+/* allow_kind(type, names): a restricted program may read these attributes on an instance of exactly `type`
+   ("[]" item reads, "[]=" item writes). Replaces any earlier entry for the type. */
+static PyObject *
+restricted_allow_kind(PyObject *module, PyObject *const *args, Py_ssize_t nargs)
+{
+    if (nargs != 2 || !PyType_Check(args[0])) {
+        PyErr_SetString(PyExc_TypeError, "allow_kind(type, names)");
+        return NULL;
+    }
+    if (_PyRestricted_AllowKind(args[0], args[1]) < 0) {
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
+/* allow_module(name, names): importing `name` is allowed, and reading these attributes of it. */
+static PyObject *
+restricted_allow_module(PyObject *module, PyObject *const *args, Py_ssize_t nargs)
+{
+    if (nargs != 2 || !PyUnicode_Check(args[0])) {
+        PyErr_SetString(PyExc_TypeError, "allow_module(name, names)");
+        return NULL;
+    }
+    if (_PyRestricted_AllowModule(args[0], args[1]) < 0) {
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
+/* allow_call(callable, lift=False): a restricted program may call it. Unlifted by default, so its own lookups are
+   gated; lift=True only for a manifest leaf whose internals legitimately touch what the gate refuses, and NEVER for
+   one that looks up names it is given (format, getattr, attrgetter). */
+static PyObject *
+restricted_allow_call(PyObject *module, PyObject *const *args, Py_ssize_t nargs)
+{
+    if (nargs < 1 || nargs > 2) {
+        PyErr_SetString(PyExc_TypeError, "allow_call(callable, lift=True)");
+        return NULL;
+    }
+    int lift = nargs == 2 ? PyObject_IsTrue(args[1]) : 0;
+    if (lift < 0 || _PyRestricted_AllowCall(args[0], lift) < 0) {
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
+/* reset(): forget every allow table (tests). */
+static PyObject *
+restricted_reset(PyObject *module, PyObject *Py_UNUSED(ignored))
+{
+    _PyRestricted_Reset();
+    Py_RETURN_NONE;
+}
+
 static PyMethodDef restricted_methods[] = {
+    {"allow_kind", _PyCFunction_CAST(restricted_allow_kind), METH_FASTCALL,
+     "allow_kind(type, names, /)\n--\n\nAllow reading these attributes on instances of exactly type."},
+    {"allow_module", _PyCFunction_CAST(restricted_allow_module), METH_FASTCALL,
+     "allow_module(name, names, /)\n--\n\nAllow importing name and reading these of its attributes."},
+    {"allow_call", _PyCFunction_CAST(restricted_allow_call), METH_FASTCALL,
+     "allow_call(callable, lift=False, /)\n--\n\nAllow calling it from restricted code; lift=True only for a manifest leaf."},
+    {"reset", restricted_reset, METH_NOARGS,
+     "reset()\n--\n\nForget every allow table."},
     {"run", _PyCFunction_CAST(restricted_run), METH_FASTCALL,
      "run(code, globals, /)\n--\n\nEvaluate a CO_RESTRICTED code object with the thread restricted."},
     {"call_lifted", _PyCFunction_CAST(restricted_call_lifted), METH_FASTCALL,
@@ -120,7 +182,19 @@ static PyMethodDef restricted_methods[] = {
 static int
 restricted_exec(PyObject *module)
 {
-    return PyModule_AddIntConstant(module, "CO_RESTRICTED", CO_RESTRICTED);
+    if (PyModule_AddIntConstant(module, "CO_RESTRICTED", CO_RESTRICTED) < 0) {
+        return -1;
+    }
+    /* NotInDialect: a refusal by the gate. A subclass of PermissionError, so code that already treats a refused
+       operation as a permission problem keeps working; the host tells the two apart by type. */
+    PyObject *exc = PyErr_NewExceptionWithDoc("_restricted.NotInDialect",
+        "The restricted-mode gate refused an operation: the program is outside the read-only dialect.",
+        PyExc_PermissionError, NULL);
+    if (exc == NULL) {
+        return -1;
+    }
+    _PyRestricted_SetException(exc);
+    return PyModule_Add(module, "NotInDialect", exc);
 }
 
 static PyModuleDef_Slot restricted_slots[] = {

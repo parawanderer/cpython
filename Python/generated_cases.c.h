@@ -1616,7 +1616,7 @@
                 stack_pointer[-2 - oparg] = callable;
                 stack_pointer[-1 - oparg] = self_or_null;
                 _PyFrame_SetStackPointer(frame, stack_pointer);
-                PyObject *res_o = PyObject_Vectorcall(
+                PyObject *res_o = _PyRestricted_Vectorcall(tstate,
                     callable_o, args_o,
                     total_args | PY_VECTORCALL_ARGUMENTS_OFFSET,
                     NULL);
@@ -2594,7 +2594,7 @@
                         JUMP_TO_LABEL(error);
                     }
                     _PyFrame_SetStackPointer(frame, stack_pointer);
-                    result_o = PyObject_Call(func, callargs, kwargs);
+                    result_o = _PyRestricted_Call(tstate, func, callargs, kwargs);
                     stack_pointer = _PyFrame_GetStackPointer(frame);
                     if (!PyFunction_Check(func) && !PyMethod_Check(func)) {
                         if (result_o == NULL) {
@@ -2651,7 +2651,7 @@
                     assert(kwargs == NULL || PyDict_CheckExact(kwargs));
                     stack_pointer[-2] = callargs_st;
                     _PyFrame_SetStackPointer(frame, stack_pointer);
-                    result_o = PyObject_Call(func, callargs, kwargs);
+                    result_o = _PyRestricted_Call(tstate, func, callargs, kwargs);
                     stack_pointer = _PyFrame_GetStackPointer(frame);
                 }
                 stack_pointer += -1;
@@ -2956,7 +2956,7 @@
                 stack_pointer[-3 - oparg] = callable;
                 stack_pointer[-2 - oparg] = self_or_null;
                 _PyFrame_SetStackPointer(frame, stack_pointer);
-                PyObject *res_o = PyObject_Vectorcall(
+                PyObject *res_o = _PyRestricted_Vectorcall(tstate,
                     callable_o, args_o,
                     positional_args | PY_VECTORCALL_ARGUMENTS_OFFSET,
                     kwnames_o);
@@ -3224,7 +3224,7 @@
                 PyObject *kwnames_o = PyStackRef_AsPyObjectBorrow(kwnames);
                 int positional_args = total_args - (int)PyTuple_GET_SIZE(kwnames_o);
                 _PyFrame_SetStackPointer(frame, stack_pointer);
-                PyObject *res_o = PyObject_Vectorcall(
+                PyObject *res_o = _PyRestricted_Vectorcall(tstate,
                     callable_o, args_o,
                     positional_args | PY_VECTORCALL_ARGUMENTS_OFFSET,
                     kwnames_o);
@@ -4076,7 +4076,7 @@
                     JUMP_TO_LABEL(error);
                 }
                 _PyFrame_SetStackPointer(frame, stack_pointer);
-                PyObject *res_o = PyObject_Vectorcall(
+                PyObject *res_o = _PyRestricted_Vectorcall(tstate,
                     callable_o, args_o,
                     total_args | PY_VECTORCALL_ARGUMENTS_OFFSET,
                     NULL);
@@ -6486,7 +6486,7 @@
                     JUMP_TO_LABEL(error);
                 }
                 _PyFrame_SetStackPointer(frame, stack_pointer);
-                PyObject *res_o = PyObject_Vectorcall(
+                PyObject *res_o = _PyRestricted_Vectorcall(tstate,
                     callable_o, args_o,
                     total_args | PY_VECTORCALL_ARGUMENTS_OFFSET,
                     NULL);
@@ -6634,7 +6634,7 @@
                         JUMP_TO_LABEL(error);
                     }
                     _PyFrame_SetStackPointer(frame, stack_pointer);
-                    result_o = PyObject_Call(func, callargs, kwargs);
+                    result_o = _PyRestricted_Call(tstate, func, callargs, kwargs);
                     stack_pointer = _PyFrame_GetStackPointer(frame);
                     if (!PyFunction_Check(func) && !PyMethod_Check(func)) {
                         if (result_o == NULL) {
@@ -6691,7 +6691,7 @@
                     assert(kwargs == NULL || PyDict_CheckExact(kwargs));
                     stack_pointer[-2] = callargs_st;
                     _PyFrame_SetStackPointer(frame, stack_pointer);
-                    result_o = PyObject_Call(func, callargs, kwargs);
+                    result_o = _PyRestricted_Call(tstate, func, callargs, kwargs);
                     stack_pointer = _PyFrame_GetStackPointer(frame);
                 }
                 stack_pointer += -1;
@@ -6862,7 +6862,7 @@
                     JUMP_TO_LABEL(error);
                 }
                 _PyFrame_SetStackPointer(frame, stack_pointer);
-                PyObject *res_o = PyObject_Vectorcall(
+                PyObject *res_o = _PyRestricted_Vectorcall(tstate,
                     callable_o, args_o,
                     positional_args | PY_VECTORCALL_ARGUMENTS_OFFSET,
                     kwnames_o);

@@ -483,6 +483,7 @@ PYTHON_OBJS=	\
 		Python/pylifecycle.o \
 		Python/pymath.o \
 		Python/pystate.o \
+		Python/restricted.o \
 		Python/pythonrun.o \
 		Python/pytime.o \
 		Python/qsbr.o \
@@ -1396,6 +1397,7 @@ PYTHON_HEADERS= \
 		$(srcdir)/Include/internal/pycore_pymem.h \
 		$(srcdir)/Include/internal/pycore_pymem_init.h \
 		$(srcdir)/Include/internal/pycore_pystate.h \
+		$(srcdir)/Include/internal/pycore_restricted.h \
 		$(srcdir)/Include/internal/pycore_pystats.h \
 		$(srcdir)/Include/internal/pycore_pythonrun.h \
 		$(srcdir)/Include/internal/pycore_pythread.h \

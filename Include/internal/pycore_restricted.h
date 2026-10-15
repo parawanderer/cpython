@@ -42,6 +42,52 @@ _PyRestricted_Active(PyThreadState *tstate)
     return 0;
 }
 
+/* Lift the gate for the C extent of an approved call (save, then restore on every exit). A CO_RESTRICTED frame
+   reached inside it is gated again by _PyRestricted_Active(). */
+typedef struct {
+    int restricted;
+    int lifted;
+    struct _PyInterpreterFrame *barrier;
+} _PyRestrictedSaved;
+
+static inline _PyRestrictedSaved
+_PyRestricted_Lift(PyThreadState *tstate)
+{
+    _PyThreadStateImpl *ts = (_PyThreadStateImpl *)tstate;
+    _PyRestrictedSaved saved = {ts->restricted, ts->restricted_lifted, ts->restricted_barrier};
+    ts->restricted = 0;
+    ts->restricted_lifted = 1;
+    ts->restricted_barrier = tstate->current_frame;
+    return saved;
+}
+
+static inline void
+_PyRestricted_Restore(PyThreadState *tstate, _PyRestrictedSaved saved)
+{
+    _PyThreadStateImpl *ts = (_PyThreadStateImpl *)tstate;
+    ts->restricted = saved.restricted;
+    ts->restricted_lifted = saved.lifted;
+    ts->restricted_barrier = saved.barrier;
+}
+
+/* The gate (Python/restricted.c). Each Check returns 0 to proceed or -1 with NotInDialect set; call only while
+   _PyRestricted_Active(). */
+extern int _PyRestricted_CheckGetAttr(PyObject *obj, PyObject *name);
+extern int _PyRestricted_CheckSetAttr(PyObject *obj, PyObject *name);
+extern int _PyRestricted_CheckItem(PyObject *obj, int write);
+extern int _PyRestricted_CheckImport(PyObject *name);
+extern int _PyRestricted_CheckCall(PyObject *callable);
+extern PyObject *_PyRestricted_Vectorcall(PyThreadState *tstate, PyObject *callable, PyObject *const *args,
+                                          size_t nargsf, PyObject *kwnames);
+extern PyObject *_PyRestricted_Call(PyThreadState *tstate, PyObject *callable, PyObject *args, PyObject *kwargs);
+
+/* Registration, host-only (Modules/_restrictedmodule.c). */
+PyAPI_FUNC(int) _PyRestricted_AllowKind(PyObject *type, PyObject *names);
+PyAPI_FUNC(int) _PyRestricted_AllowModule(PyObject *name, PyObject *names);
+PyAPI_FUNC(int) _PyRestricted_AllowCall(PyObject *callable, int lift);
+PyAPI_FUNC(void) _PyRestricted_SetException(PyObject *exc);
+PyAPI_FUNC(void) _PyRestricted_Reset(void);
+
 #ifdef __cplusplus
 }
 #endif

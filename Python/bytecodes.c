@@ -3793,7 +3793,7 @@ dummy_func(
                 DECREF_INPUTS();
                 ERROR_IF(true);
             }
-            PyObject *res_o = PyObject_Vectorcall(
+            PyObject *res_o = _PyRestricted_Vectorcall(tstate, 
                 callable_o, args_o,
                 total_args | PY_VECTORCALL_ARGUMENTS_OFFSET,
                 NULL);
@@ -3948,7 +3948,7 @@ dummy_func(
                 DECREF_INPUTS();
                 ERROR_IF(true);
             }
-            PyObject *res_o = PyObject_Vectorcall(
+            PyObject *res_o = _PyRestricted_Vectorcall(tstate, 
                 callable_o, args_o,
                 total_args | PY_VECTORCALL_ARGUMENTS_OFFSET,
                 NULL);
@@ -4672,7 +4672,7 @@ dummy_func(
                 DECREF_INPUTS();
                 ERROR_IF(true);
             }
-            PyObject *res_o = PyObject_Vectorcall(
+            PyObject *res_o = _PyRestricted_Vectorcall(tstate, 
                 callable_o, args_o,
                 positional_args | PY_VECTORCALL_ARGUMENTS_OFFSET,
                 kwnames_o);
@@ -4828,7 +4828,7 @@ dummy_func(
             }
             PyObject *kwnames_o = PyStackRef_AsPyObjectBorrow(kwnames);
             int positional_args = total_args - (int)PyTuple_GET_SIZE(kwnames_o);
-            PyObject *res_o = PyObject_Vectorcall(
+            PyObject *res_o = _PyRestricted_Vectorcall(tstate, 
                 callable_o, args_o,
                 positional_args | PY_VECTORCALL_ARGUMENTS_OFFSET,
                 kwnames_o);
@@ -4886,7 +4886,7 @@ dummy_func(
                 if (err) {
                     ERROR_NO_POP();
                 }
-                result_o = PyObject_Call(func, callargs, kwargs);
+                result_o = _PyRestricted_Call(tstate, func, callargs, kwargs);
 
                 if (!PyFunction_Check(func) && !PyMethod_Check(func)) {
                     if (result_o == NULL) {
@@ -4933,7 +4933,7 @@ dummy_func(
                 assert(PyTuple_CheckExact(callargs));
                 PyObject *kwargs = PyStackRef_AsPyObjectBorrow(kwargs_st);
                 assert(kwargs == NULL || PyDict_CheckExact(kwargs));
-                result_o = PyObject_Call(func, callargs, kwargs);
+                result_o = _PyRestricted_Call(tstate, func, callargs, kwargs);
             }
             PyStackRef_XCLOSE(kwargs_st);
             PyStackRef_CLOSE(callargs_st);
