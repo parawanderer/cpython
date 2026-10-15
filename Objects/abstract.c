@@ -163,6 +163,9 @@ PyObject_GetItem(PyObject *o, PyObject *key)
             return NULL;
         }
         if (lift) {
+            if (_PyRestricted_CheckCrossing(&key, 1) < 0) {
+                return NULL;
+            }
             _PyRestrictedSaved saved = _PyRestricted_Lift(rtstate);
             PyObject *res = PyObject_GetItem(o, key);
             _PyRestricted_Restore(rtstate, saved);
@@ -250,6 +253,10 @@ PyObject_SetItem(PyObject *o, PyObject *key, PyObject *value)
             return -1;
         }
         if (lift) {
+            PyObject *crossing[2] = {key, value};
+            if (_PyRestricted_CheckCrossing(crossing, 2) < 0) {
+                return -1;
+            }
             _PyRestrictedSaved saved = _PyRestricted_Lift(rtstate);
             int res = PyObject_SetItem(o, key, value);
             _PyRestricted_Restore(rtstate, saved);
@@ -297,6 +304,9 @@ PyObject_DelItem(PyObject *o, PyObject *key)
             return -1;
         }
         if (lift) {
+            if (_PyRestricted_CheckCrossing(&key, 1) < 0) {
+                return -1;
+            }
             _PyRestrictedSaved saved = _PyRestricted_Lift(rtstate);
             int res = PyObject_DelItem(o, key);
             _PyRestricted_Restore(rtstate, saved);
@@ -1265,6 +1275,10 @@ binary_iop1(PyObject *v, PyObject *w, const int iop_slot, const int op_slot
     if (mv != NULL) {
         binaryfunc slot = NB_BINOP(mv, iop_slot);
         if (slot) {
+            /* window.ml restricted mode: an in-place slot writes v, so v must be the cell's own. */
+            if (_PyRestricted_Active(_PyThreadState_GET()) && _PyRestricted_CheckInPlace(v) < 0) {
+                return NULL;
+            }
             PyObject *x = (slot)(v, w);
             assert(_Py_CheckSlotResult(v, op_name, x != NULL));
             if (x != Py_NotImplemented) {
@@ -1306,6 +1320,9 @@ ternary_iop(PyObject *v, PyObject *w, PyObject *z, const int iop_slot, const int
     if (mv != NULL) {
         ternaryfunc slot = NB_TERNOP(mv, iop_slot);
         if (slot) {
+            if (_PyRestricted_Active(_PyThreadState_GET()) && _PyRestricted_CheckInPlace(v) < 0) {
+                return NULL;
+            }
             PyObject *x = (slot)(v, w, z);
             if (x != Py_NotImplemented) {
                 return x;
@@ -1343,6 +1360,9 @@ PyNumber_InPlaceAdd(PyObject *v, PyObject *w)
         Py_DECREF(result);
         if (m != NULL) {
             binaryfunc func = m->sq_inplace_concat;
+            if (func != NULL && _PyRestricted_Active(_PyThreadState_GET()) && _PyRestricted_CheckInPlace(v) < 0) {
+                return NULL;
+            }
             if (func == NULL)
                 func = m->sq_concat;
             if (func != NULL) {
@@ -1368,6 +1388,9 @@ PyNumber_InPlaceMultiply(PyObject *v, PyObject *w)
         Py_DECREF(result);
         if (mv != NULL) {
             f = mv->sq_inplace_repeat;
+            if (f != NULL && _PyRestricted_Active(_PyThreadState_GET()) && _PyRestricted_CheckInPlace(v) < 0) {
+                return NULL;
+            }
             if (f == NULL)
                 f = mv->sq_repeat;
             if (f != NULL)

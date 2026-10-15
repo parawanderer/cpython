@@ -16,6 +16,7 @@
 #include "pycore_pyatomic_ft_wrappers.h" // FT_ATOMIC_LOAD_UINT8_RELAXED()
 #include "pycore_pyerrors.h"      // _PyErr_ClearExcState()
 #include "pycore_pystate.h"       // _PyThreadState_GET()
+#include "pycore_restricted.h"    // _PyRestricted_IsLiftedGen()
 #include "pycore_warnings.h"      // _PyErr_WarnUnawaitedCoroutine()
 #include "pycore_weakref.h"       // FT_CLEAR_WEAKREFS()
 
@@ -256,7 +257,16 @@ gen_send_ex2(PyGenObject *gen, PyObject *arg, PyObject **presult,
 
     gen->gi_frame_state = FRAME_EXECUTING;
     EVAL_CALL_STAT_INC(EVAL_CALL_GENERATOR);
-    PyObject *result = _PyEval_EvalFrame(tstate, frame, exc);
+    PyObject *result;
+    /* window.ml restricted mode: a generator a lifted extent created resumes lifted (pycore_restricted.h). */
+    if (_PyRestricted_Active(tstate) && _PyRestricted_IsLiftedGen((PyObject *)gen)) {
+        _PyRestrictedSaved saved = _PyRestricted_Lift(tstate);
+        result = _PyEval_EvalFrame(tstate, frame, exc);
+        _PyRestricted_Restore(tstate, saved);
+    }
+    else {
+        result = _PyEval_EvalFrame(tstate, frame, exc);
+    }
     assert(tstate->exc_info == prev_exc_info);
     assert(gen->gi_exc_state.previous_item == NULL);
     assert(gen->gi_frame_state != FRAME_EXECUTING);

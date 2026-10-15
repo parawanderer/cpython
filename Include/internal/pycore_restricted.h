@@ -95,11 +95,30 @@ extern PyObject *_PyRestricted_Call(PyThreadState *tstate, PyObject *callable, P
    _restricted.run()). Returns 0, or -1 with NotInDialect set. */
 extern int _PyRestricted_Tick(PyThreadState *tstate);
 
+/* What crosses into a lifted extent other than through a leaf's checker: item keys and values under "[]^", and a
+   lifted dunder's operands. And whether a kind's Python dunders run lifted ("__^"). */
+extern int _PyRestricted_CheckCrossing(PyObject *const *objs, Py_ssize_t n);
+extern int _PyRestricted_LiftsDunders(PyObject *self);
+/* Was this generator created inside a lifted extent (library code)? Then resuming it runs lifted. */
+extern int _PyRestricted_IsLiftedGen(PyObject *gen);
+
+/* Ownership (slice 5): is `obj` the cell's own; refuse an in-place operator on a value that is not; get the owned set
+   ready before a run. */
+PyAPI_FUNC(int) _PyRestricted_IsOwned(PyObject *obj);
+extern int _PyRestricted_CheckInPlace(PyObject *v);
+PyAPI_FUNC(int) _PyRestricted_OwnedReady(void);
+
+/* Memory (slice 5): a byte cap per run, counted at the RAW and arena allocators. */
+PyAPI_FUNC(int) _PyRestricted_MemoryBegin(long long limit);
+PyAPI_FUNC(int) _PyRestricted_MemoryEnd(long long *peak);
+
 /* Registration, host-only (Modules/_restrictedmodule.c). */
 PyAPI_FUNC(int) _PyRestricted_AllowKind(PyObject *type, PyObject *names);
 PyAPI_FUNC(int) _PyRestricted_AllowModule(PyObject *name, PyObject *names);
 PyAPI_FUNC(int) _PyRestricted_AllowCall(PyObject *callable, int lift, PyObject *checker);
 PyAPI_FUNC(int) _PyRestricted_AllowDynamic(PyObject *type, PyObject *predicate);
+PyAPI_FUNC(int) _PyRestricted_AllowMutators(PyObject *type, PyObject *names);
+PyAPI_FUNC(int) _PyRestricted_AllowFresh(PyObject *callable);
 extern int _PyRestricted_ReadAttrLifted(PyObject *obj, PyObject *name, PyObject **result);
 PyAPI_FUNC(void) _PyRestricted_SetException(PyObject *exc);
 PyAPI_FUNC(void) _PyRestricted_Reset(void);

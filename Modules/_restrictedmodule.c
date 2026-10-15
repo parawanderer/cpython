@@ -24,21 +24,25 @@
 /* How deep a program's own frames may sit above where the run began, in Python frames (the JS dialect's
    MAX_CALL_DEPTH). */
 #define RESTRICTED_DEFAULT_DEPTH 256
+/* Bytes a run may add to the heap, net (the RAW allocator's blocks and pymalloc's arenas: Python/restricted.c). */
+#define RESTRICTED_DEFAULT_MEMORY (256LL << 20)
 /* Frames left below the depth for CPython's own limit, so the dialect's refusal comes before a RecursionError. */
 #define RESTRICTED_DEPTH_MARGIN 50
 
 static long long last_used;
+static long long last_peak;     /* the most heap the last outermost run held at once */
 static PyObject *not_in_dialect;  /* borrowed: the module keeps it alive; set at init */     /* steps the last finished run used (one interpreter per process, as the gate) */
 
-/* run(code, globals, budget=None, depth=None, /): evaluate a CO_RESTRICTED code object in `globals`, with the thread
+/* run(code, globals, budget=None, depth=None, memory=None, /): evaluate a CO_RESTRICTED code object in `globals`, with the thread
    restricted, metered and depth-bounded for the call. The previous state is restored on every exit, an exception
    included, because this is a C call. A run during which anything was refused ends in NotInDialect, however it ended:
    library code that caught the refusal cannot turn it into a value. */
 static PyObject *
 restricted_run(PyObject *module, PyObject *const *args, Py_ssize_t nargs)
 {
-    if (nargs < 2 || nargs > 4) {
-        PyErr_SetString(PyExc_TypeError, "run() takes 2 to 4 arguments (code, globals, budget=None, depth=None)");
+    if (nargs < 2 || nargs > 5) {
+        PyErr_SetString(PyExc_TypeError,
+                        "run() takes 2 to 5 arguments (code, globals, budget=None, depth=None, memory=None)");
         return NULL;
     }
     PyObject *code = args[0], *globals = args[1];
@@ -76,6 +80,20 @@ restricted_run(PyObject *module, PyObject *const *args, Py_ssize_t nargs)
             return NULL;
         }
     }
+    long long memory = RESTRICTED_DEFAULT_MEMORY;
+    if (nargs > 4 && args[4] != Py_None) {
+        memory = PyLong_AsLongLong(args[4]);
+        if (memory == -1 && PyErr_Occurred()) {
+            return NULL;
+        }
+        if (memory < 0) {
+            PyErr_SetString(PyExc_ValueError, "run() needs a memory cap >= 0");
+            return NULL;
+        }
+    }
+    if (_PyRestricted_OwnedReady() < 0) {
+        return NULL;
+    }
     PyThreadState *tstate = _PyThreadState_GET();
     _PyThreadStateImpl *ts = (_PyThreadStateImpl *)tstate;
     int room = tstate->py_recursion_remaining - RESTRICTED_DEPTH_MARGIN;
@@ -98,14 +116,29 @@ restricted_run(PyObject *module, PyObject *const *args, Py_ssize_t nargs)
     ts->restricted_depth_limit = (int)depth;
     ts->restricted_tripped = 0;
     _Py_set_eval_breaker_bit(tstate, _PY_EVAL_RESTRICTED_BIT);
-
-    PyObject *result = PyEval_EvalCode(code, globals, globals);
+    int counting = _PyRestricted_MemoryBegin(memory);
+    PyObject *result = counting < 0 ? NULL : PyEval_EvalCode(code, globals, globals);
 
     if (!was_metered) {
         _Py_unset_eval_breaker_bit(tstate, _PY_EVAL_RESTRICTED_BIT);
     }
+    int memory_hit = 0;
+    if (counting > 0) {
+        memory_hit = _PyRestricted_MemoryEnd(&last_peak);
+    }
+    if (memory_hit) {
+        /* The cap is the refusal, whatever the failed allocation turned into on the way out. */
+        Py_CLEAR(result);
+        PyObject *exc = PyErr_GetRaisedException();
+        PyErr_Format(not_in_dialect, "not in dialect: the cell's memory cap (%lld bytes) ran out", memory);
+        if (exc != NULL) {
+            PyObject *now = PyErr_GetRaisedException();
+            PyException_SetContext(now, exc);
+            PyErr_SetRaisedException(now);
+        }
+    }
     last_used = ts->restricted_steps < 0 ? budget + 1 : budget - ts->restricted_steps;
-    if (ts->restricted_tripped) {
+    if (ts->restricted_tripped && !memory_hit) {
         PyObject *exc = PyErr_GetRaisedException();
         if (exc == NULL || !PyErr_GivenExceptionMatches(exc, not_in_dialect)) {
             /* Library code caught the refusal and went on (to a value, or to another error). */
@@ -131,6 +164,45 @@ restricted_run(PyObject *module, PyObject *const *args, Py_ssize_t nargs)
     ts->restricted_depth_limit = saved_limit;
     ts->restricted_tripped = saved_tripped;
     return result;
+}
+
+/* allow_mutators(type, names): these methods write their receiver; restricted code reads them only off a value it
+   owns. */
+static PyObject *
+restricted_allow_mutators(PyObject *module, PyObject *const *args, Py_ssize_t nargs)
+{
+    if (nargs != 2 || !PyType_Check(args[0])) {
+        PyErr_SetString(PyExc_TypeError, "allow_mutators(type, names)");
+        return NULL;
+    }
+    if (_PyRestricted_AllowMutators(args[0], args[1]) < 0) {
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
+/* allow_fresh(callable): a lifted leaf whose result is a new value, owned by the cell (the manifest's `fresh`). */
+static PyObject *
+restricted_allow_fresh(PyObject *module, PyObject *callable)
+{
+    if (_PyRestricted_AllowFresh(callable) < 0) {
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
+/* owned(obj): whether obj is the cell's own (an entry checker asks before a leaf writes its receiver). */
+static PyObject *
+restricted_owned(PyObject *module, PyObject *obj)
+{
+    return PyBool_FromLong(_PyRestricted_IsOwned(obj));
+}
+
+/* memory(): the most heap the last run held at once, in bytes (RAW blocks and arenas). */
+static PyObject *
+restricted_memory(PyObject *module, PyObject *unused)
+{
+    return PyLong_FromLongLong(last_peak);
 }
 
 /* steps(): the steps the last finished run used (budget + 1 when it ran out). */
@@ -277,7 +349,15 @@ static PyMethodDef restricted_methods[] = {
     {"reset", restricted_reset, METH_NOARGS,
      "reset()\n--\n\nForget every allow table."},
     {"run", _PyCFunction_CAST(restricted_run), METH_FASTCALL,
-     "run(code, globals, budget=None, depth=None, /)\n--\n\nEvaluate a CO_RESTRICTED code object with the thread restricted, metered by\na step budget and bounded in depth."},
+     "run(code, globals, budget=None, depth=None, memory=None, /)\n--\n\nEvaluate a CO_RESTRICTED code object with the thread restricted, metered by\na step budget, bounded in depth and capped in memory."},
+    {"allow_mutators", _PyCFunction_CAST(restricted_allow_mutators), METH_FASTCALL,
+     "allow_mutators(type, names, /)\n--\n\nThese methods write their receiver: read only off an owned value."},
+    {"allow_fresh", restricted_allow_fresh, METH_O,
+     "allow_fresh(callable, /)\n--\n\nA lifted leaf whose result is a new value, owned by the cell."},
+    {"owned", restricted_owned, METH_O,
+     "owned(obj, /)\n--\n\nWhether obj is the cell's own."},
+    {"memory", restricted_memory, METH_NOARGS,
+     "memory()\n--\n\nThe most heap the last run held at once, in bytes."},
     {"steps", restricted_steps, METH_NOARGS,
      "steps()\n--\n\nThe steps the last finished run used (budget + 1 when it ran out)."},
     {"call_lifted", _PyCFunction_CAST(restricted_call_lifted), METH_FASTCALL,
@@ -293,7 +373,8 @@ static int
 restricted_exec(PyObject *module)
 {
     if (PyModule_Add(module, "DEFAULT_BUDGET", PyLong_FromLongLong(RESTRICTED_DEFAULT_BUDGET)) < 0
-        || PyModule_AddIntConstant(module, "DEFAULT_DEPTH", RESTRICTED_DEFAULT_DEPTH) < 0)
+        || PyModule_AddIntConstant(module, "DEFAULT_DEPTH", RESTRICTED_DEFAULT_DEPTH) < 0
+        || PyModule_Add(module, "DEFAULT_MEMORY", PyLong_FromLongLong(RESTRICTED_DEFAULT_MEMORY)) < 0)
     {
         return -1;
     }

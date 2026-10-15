@@ -458,5 +458,327 @@ class BudgetTest(unittest.TestCase):
         self.refused(f"return len(range(-1, {restricted.MAX_COLLECTION}))", "range of more than")
 
 
+def make_list():
+    """Host code that builds a list: lifted, so the list is NOT the cell's (not fresh-marked)."""
+    return [1]
+
+
+def make_fresh():
+    """The same, registered as a FRESH leaf."""
+    return [1]
+
+
+def give_back(x):
+    """A leaf registered FRESH that hands back its argument: the gate must not mark that owned."""
+    return x
+
+
+class OwnershipTest(unittest.TestCase):
+    """Slice 5: writes need a value the cell owns (made under the gate, or a FRESH leaf result), on every path: item
+    writes, deletes, in-place operators, and a mutating method, which is not even read off a value the cell does not
+    own (so no bound one reaches a C loop)."""
+
+    def setUp(self):
+        for f in (len, list, map, sorted, sum, bytearray, set, dict, range):
+            _restricted.allow_call(f, False)
+        _restricted.allow_kind(list, ["append", "extend", "sort", "copy", "[]", "[]="])
+        _restricted.allow_kind(dict, ["get", "update", "[]", "[]="])
+        _restricted.allow_kind(set, ["add"])
+        _restricted.allow_kind(bytearray, ["append", "[]", "[]="])
+        for t, names in restricted.MUTATORS.items():
+            _restricted.allow_mutators(t, names)
+        for f in (make_list, make_fresh, give_back, each):
+            _restricted.allow_call(f, True)
+        _restricted.allow_fresh(make_fresh)
+        _restricted.allow_fresh(give_back)
+
+    def tearDown(self):
+        _restricted.reset()
+
+    def run_cell(self, src, ns=None, **names):
+        ns = {} if ns is None else ns
+        ns.update(names, make_list=make_list, make_fresh=make_fresh, give_back=give_back, each=each)
+        return restricted.run_cell(src, ns)
+
+    def refused(self, src, ns=None, **names):
+        with self.assertRaisesRegex(_restricted.NotInDialect, "does not own", msg=src):
+            self.run_cell(src, ns, **names)
+
+    # --- the cell's own values ---
+
+    def test_a_list_the_cell_built(self):
+        self.assertEqual(self.run_cell("xs = []\nxs.append(1)\nxs[0] = 2\nxs += [3]\nxs *= 2\ndel xs[0]\n"
+                                       "return xs"), [3, 2, 3])
+
+    def test_a_dict_and_a_set_the_cell_built(self):
+        self.assertEqual(self.run_cell("d = {}\nd['a'] = 1\nd.update({'b': 2})\nd |= {'c': 3}\ns = set()\n"
+                                       "s.add(1)\ns |= {2}\nreturn [d, len(s)]"), [{"a": 1, "b": 2, "c": 3}, 2])
+
+    def test_a_bytearray_the_cell_built(self):
+        self.assertEqual(self.run_cell("b = bytearray(2)\nb[0] = 7\nb.append(1)\nreturn len(b)"), 3)
+
+    def test_an_earlier_cells_list(self):
+        ns = {}
+        self.run_cell("xs = [1]", ns)
+        self.assertEqual(self.run_cell("xs.append(2)\nreturn xs", ns), [1, 2])
+
+    def test_sorted_sorts_its_own_new_list(self):
+        self.assertEqual(self.run_cell("return sorted(xs)", xs=[3, 1, 2]), [1, 2, 3])
+
+    def test_a_list_built_in_a_callback_from_a_lifted_leaf(self):
+        self.assertEqual(self.run_cell("ys = []\neach(lambda i: ys.append(i), 3)\nreturn ys"), [0, 1, 2])
+
+    def test_numbers_and_strings_are_rebound_not_written(self):
+        self.assertEqual(self.run_cell("n = 1\nn += 1\nt = 'a'\nt += 'b'\nu = (1,)\nu += (2,)\n"
+                                       "return [n, t, u]"), [2, "ab", (1, 2)])
+
+    # --- injected values ---
+
+    def test_an_injected_list(self):
+        for src in ("xs.append(1)", "xs[0] = 9", "del xs[0]", "xs += [1]", "xs *= 2", "xs.sort()",
+                    "xs.extend([1])", "xs[0:1] = [5]"):
+            xs = [3, 1, 2]
+            self.refused(src, xs=xs)
+            self.assertEqual(xs, [3, 1, 2], src)
+
+    def test_an_injected_dict_and_set(self):
+        for src in ("d['b'] = 2", "d.update({'b': 2})", "d |= {'b': 2}", "del d['a']", "s |= {2}", "s.add(2)"):
+            d, st = {"a": 1}, {1}
+            self.refused(src, d=d, s=st)
+            self.assertEqual((d, st), ({"a": 1}, {1}), src)
+
+    def test_reads_of_an_injected_value_still_work(self):
+        self.assertEqual(self.run_cell("return [xs[0], d.get('a'), len(xs)]", xs=[1], d={"a": 2}), [1, 2, 1])
+
+    def test_a_bound_mutator_cannot_reach_a_c_loop(self):
+        xs = []
+        self.refused("return list(map(xs.append, [1, 2]))", xs=xs)
+        self.assertEqual(xs, [])
+
+    def test_a_copy_of_an_injected_list_is_the_cells(self):
+        xs = [1]
+        self.assertEqual(self.run_cell("ys = list(xs)\nys.append(2)\nzs = xs[:]\nzs.append(3)\nreturn [ys, zs]",
+                                       xs=xs), [[1, 2], [1, 3]])
+        self.assertEqual(xs, [1])
+
+    def test_an_owned_container_of_injected_values(self):
+        inner = [1]
+        self.refused("outer = [inner]\nouter[0].append(2)", inner=inner)
+        self.assertEqual(inner, [1])
+
+    # --- leaf results ---
+
+    def test_a_lifted_leafs_result_is_not_owned(self):
+        self.refused("ys = make_list()\nys.append(2)")
+
+    def test_a_fresh_leafs_result_is_owned(self):
+        self.assertEqual(self.run_cell("ys = make_fresh()\nys.append(2)\nreturn ys"), [1, 2])
+
+    def test_a_fresh_leaf_handing_back_its_argument(self):
+        xs = [1]
+        self.refused("give_back(xs).append(2)", xs=xs)
+        self.assertEqual(xs, [1])
+
+    # --- the set follows the heap ---
+
+    def test_a_freed_owned_address_is_never_owned_again(self):
+        self.run_cell("for i in range(200):\n    t = [i]\nreturn 1")
+        made = [[i] for i in range(5000)]     # host lists, some at addresses the cell's freed lists had
+        self.assertFalse(any(_restricted.owned(x) for x in made))
+
+    def test_a_cells_list_is_owned_after_the_run(self):
+        xs = self.run_cell("return [1]")
+        self.assertTrue(_restricted.owned(xs))
+        self.assertFalse(_restricted.owned([1]))
+
+
+class MemoryTest(unittest.TestCase):
+    """Slice 5: a byte cap per run, counted where CPython takes memory for blocks over 512 bytes and for arenas, net of
+    what the run frees. A request past the cap fails before anything is allocated."""
+
+    def setUp(self):
+        for f in (len, list, range, sum):
+            _restricted.allow_call(f, False, restricted._range_cost if f is range else None)
+        _restricted.allow_call(swallow, True)
+
+    def tearDown(self):
+        _restricted.reset()
+
+    def run_cell(self, src, memory=None, **names):
+        return restricted.run_cell(src, dict(names, swallow=swallow), memory=memory)
+
+    def refused(self, src, **kw):
+        with self.assertRaisesRegex(_restricted.NotInDialect, "memory", msg=src):
+            self.run_cell(src, **kw)
+
+    def test_a_string_repeated_past_memory(self):
+        import time
+        t = time.perf_counter()
+        self.refused('return len("a" * 10 ** 11)')
+        self.assertLess(time.perf_counter() - t, 1, "refused before the allocation, not after it")
+
+    def test_a_doubling_list(self):
+        self.refused("x = [1]\nfor _ in range(64):\n    x = x + x\nreturn len(x)")
+
+    def test_a_list_within_the_cap(self):
+        self.assertEqual(self.run_cell("return len([0] * 10 ** 6)"), 10 ** 6)
+        self.assertGreaterEqual(_restricted.memory(), 8 * 10 ** 6)
+
+    def test_a_smaller_cap(self):
+        self.refused("return len([0] * 10 ** 6)", memory=10 ** 6)
+
+    def test_many_small_objects_count_too(self):
+        # 2e5 small lists live at once: pymalloc arenas, not RAW blocks.
+        self.refused("return len([[i] for i in range(200000)])", memory=4 * 10 ** 6)
+
+    def test_freed_memory_is_given_back(self):
+        # 100 lists of 8 MB, each dropped before the next: about 8 MB live at a time, under a 64 MB cap.
+        self.assertEqual(self.run_cell("n = 0\nfor i in range(100):\n    x = [0] * 10 ** 6\n    n += len(x)\n"
+                                       "return n", memory=64 * 10 ** 6), 10 ** 8)
+
+    def test_a_swallowed_memory_error_still_refuses(self):
+        self.refused('return swallow(lambda: "a" * 10 ** 11)')
+
+    def test_the_cap_ends_with_the_run(self):
+        self.refused("return len([0] * 10 ** 6)", memory=10 ** 6)
+        self.assertEqual(len("a" * 10 ** 7), 10 ** 7, "the host allocates freely after a run")
+        self.assertEqual(self.run_cell("return len([0] * 10 ** 6)"), 10 ** 6, "the next run gets a fresh cap")
+
+
+class Frame:
+    """A stand-in for a pandas object: Python dunders that read internals the gate would refuse, and a __getitem__
+    that calls a callable key, as pandas' does (df[f] is f(df))."""
+
+    def __init__(self, n):
+        self._n = n
+
+    def __len__(self):
+        return self._n
+
+    def __add__(self, other):
+        return Frame(self._n + (other._n if isinstance(other, Frame) else other))
+
+    def __getitem__(self, key):
+        return key(self) if callable(key) else key
+
+
+class PlainFrame(Frame):
+    """The same, with its kind NOT listing "__^"."""
+
+
+class LiftedDunderTest(unittest.TestCase):
+    """A kind that lists "__^" has its Python dunders run lifted when a type slot reaches them (len, +, iteration),
+    after the gate's own barrier; and what crosses into a lifted extent (a "[]^" item key or value, a lifted dunder's
+    operand) obeys the callback rule: a callable must be the program's own function."""
+
+    def setUp(self):
+        for f in (len,):
+            _restricted.allow_call(f, False)
+        _restricted.allow_kind(Frame, ["[]", "[]^", "__^"])
+        _restricted.allow_kind(PlainFrame, ["[]", "[]^"])
+        _restricted.allow_kind(str, ["format"])
+
+    def tearDown(self):
+        _restricted.reset()
+
+    def run_cell(self, src, **names):
+        return restricted.run_cell(src, dict(names))
+
+    def test_a_listed_kinds_dunders_run_lifted(self):
+        self.assertEqual(self.run_cell("return len(f)", f=Frame(3)), 3)
+        self.assertEqual(self.run_cell("return len(f + 2)", f=Frame(3)), 5)
+
+    def test_an_unlisted_kinds_dunders_run_gated(self):
+        with self.assertRaisesRegex(_restricted.NotInDialect, "_n"):
+            self.run_cell("return len(f)", f=PlainFrame(3))
+
+    def test_a_callable_key_must_be_the_programs_own(self):
+        self.assertEqual(self.run_cell("return f[lambda x: 7]", f=Frame(1)), 7)
+        for key in ('"{0.__class__}".format', "len"):
+            with self.assertRaisesRegex(_restricted.NotInDialect, "not the program's own", msg=key):
+                self.run_cell(f"return f[{key}]", f=Frame(1))
+
+    def test_a_callable_inside_a_key(self):
+        with self.assertRaisesRegex(_restricted.NotInDialect, "not the program's own"):
+            self.run_cell('return f[("a", ["{0.__class__}".format])]', f=Frame(1))
+
+    def test_a_class_as_a_key_is_data(self):
+        self.assertTrue(self.run_cell("return len(f[str]) > 0", f=Frame(4)))
+
+    def test_a_lifted_dunders_operand(self):
+        with self.assertRaisesRegex(_restricted.NotInDialect, "not the program's own"):
+            self.run_cell('return f + "{0.__class__}".format', f=Frame(1))
+
+
+try:
+    import warnings
+    with warnings.catch_warnings():     # numpy adds filters at import; keep the test environment as it was
+        import numpy
+        import pandas
+except ImportError:
+    numpy = pandas = None
+
+
+@unittest.skipIf(pandas is None, "needs numpy and pandas (stock wheels) installed for this build")
+class StockWheelsTest(unittest.TestCase):
+    """The ABI rule: stock numpy and pandas wheels, built for stock CPython, import and run under the patched binary,
+    and run lifted from a restricted cell: methods and dunders, ownership of a copy, and the barriers."""
+
+    def setUp(self):
+        pd = pandas
+        for f in (len, int, list, sum):
+            _restricted.allow_call(f, False)
+        _restricted.allow_module("pandas", ["DataFrame"])
+        _restricted.allow_call(pd.DataFrame, True)
+        _restricted.allow_fresh(pd.DataFrame)
+        for cls in (pd.DataFrame, pd.Series):
+            _restricted.allow_kind(cls, ["sum", "copy", "[]", "[]=", "[]^", "__^"])
+            _restricted.allow_call(cls.sum, True)
+            _restricted.allow_call(cls.copy, True)
+            _restricted.allow_fresh(cls.copy)
+        _restricted.allow_kind(numpy.int64, [])
+        _restricted.allow_kind(str, ["format"])
+
+    def tearDown(self):
+        _restricted.reset()
+
+    def df(self):
+        return pandas.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
+
+    def run_cell(self, src, **names):
+        return restricted.run_cell(src, dict(names))
+
+    def test_the_wheels_are_stock(self):
+        self.assertFalse(any(_restricted.build().values()))
+        self.assertTrue(numpy.__file__ and pandas.__file__)
+
+    def test_methods_and_dunders(self):
+        df = self.df()
+        self.assertEqual(self.run_cell("return int(df['a'].sum())", df=df), 6)
+        self.assertEqual(self.run_cell("return len(df)", df=df), 3)
+        self.assertEqual(self.run_cell("return int((df['a'] * 2).sum())", df=df), 12)
+        self.assertEqual(self.run_cell("return int((df['a'] > 1).sum())", df=df), 2)
+        self.assertEqual(self.run_cell("return [c for c in df]", df=df), ["a", "b"])
+
+    def test_an_injected_frame_is_not_the_cells(self):
+        df = self.df()
+        for src in ("df['c'] = 1", "df += 1", "df['a'] += 1"):
+            with self.assertRaises(_restricted.NotInDialect, msg=src):
+                self.run_cell(src, df=df)
+        self.assertEqual(list(df.columns), ["a", "b"])
+        self.assertEqual(int(df["a"].sum()), 6)
+
+    def test_a_copy_is_the_cells(self):
+        df = self.df()
+        self.assertEqual(self.run_cell("d = df.copy()\nd['c'] = 1\nd += 1\nreturn int(d['c'].sum())", df=df), 6)
+        self.assertEqual(list(df.columns), ["a", "b"])
+
+    def test_a_callable_key(self):
+        df = self.df()
+        self.assertEqual(self.run_cell("return int(df[lambda d: d['a'] > 1]['a'].sum())", df=df), 5)
+        with self.assertRaisesRegex(_restricted.NotInDialect, "not the program's own"):
+            self.run_cell('return df["{0.__class__}".format]', df=df)
+
+
 if __name__ == "__main__":
     unittest.main()
