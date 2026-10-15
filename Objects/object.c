@@ -2,6 +2,7 @@
 /* Generic object operations; and implementation of None */
 
 #include "Python.h"
+#include "pycore_restricted.h"     // _PyRestricted_Active()
 #include "pycore_brc.h"           // _Py_brc_queue_object()
 #include "pycore_call.h"          // _PyObject_CallNoArgs()
 #include "pycore_ceval.h"         // _Py_EnterRecursiveCallTstate()
@@ -1293,6 +1294,9 @@ PyObject_GetAttr(PyObject *v, PyObject *name)
                      Py_TYPE(name)->tp_name);
         return NULL;
     }
+    if (_PyRestricted_Active(_PyThreadState_GET()) && _PyRestricted_CheckGetAttr(v, name) < 0) {
+        return NULL;
+    }
 
     PyObject* result = NULL;
     if (tp->tp_getattro != NULL) {
@@ -1326,6 +1330,10 @@ PyObject_GetOptionalAttr(PyObject *v, PyObject *name, PyObject **result)
         PyErr_Format(PyExc_TypeError,
                      "attribute name must be string, not '%.200s'",
                      Py_TYPE(name)->tp_name);
+        *result = NULL;
+        return -1;
+    }
+    if (_PyRestricted_Active(_PyThreadState_GET()) && _PyRestricted_CheckGetAttr(v, name) < 0) {
         *result = NULL;
         return -1;
     }
@@ -1443,6 +1451,9 @@ PyObject_SetAttr(PyObject *v, PyObject *name, PyObject *value)
         PyErr_Format(PyExc_TypeError,
                      "attribute name must be string, not '%.200s'",
                      Py_TYPE(name)->tp_name);
+        return -1;
+    }
+    if (_PyRestricted_Active(_PyThreadState_GET()) && _PyRestricted_CheckSetAttr(v, name) < 0) {
         return -1;
     }
     Py_INCREF(name);
@@ -1578,6 +1589,9 @@ _PyObject_GetMethod(PyObject *obj, PyObject *name, PyObject **method)
     int meth_found = 0;
 
     assert(*method == NULL);
+    if (_PyRestricted_Active(_PyThreadState_GET()) && _PyRestricted_CheckGetAttr(obj, name) < 0) {
+        return 0;
+    }
 
     PyTypeObject *tp = Py_TYPE(obj);
     if (!_PyType_IsReady(tp)) {

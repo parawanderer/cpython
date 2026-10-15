@@ -3,6 +3,7 @@
 #define _PY_INTERPRETER
 
 #include "Python.h"
+#include "pycore_restricted.h"     // window.ml restricted mode
 #include "pycore_abstract.h"      // _PyIndex_Check()
 #include "pycore_audit.h"         // _PySys_Audit()
 #include "pycore_backoff.h"
@@ -3076,8 +3077,36 @@ _PyEval_SliceIndexNotNone(PyObject *v, Py_ssize_t *pi)
     return 1;
 }
 
+static PyObject *
+import_name_impl(PyThreadState *tstate, _PyInterpreterFrame *frame,
+            PyObject *name, PyObject *fromlist, PyObject *level);
+
+/* window.ml restricted mode: an import from restricted code must name a listed module (absolute only); the import
+   machinery itself (importlib, pure Python) then runs lifted, since it is the host's, not the program's. */
 PyObject *
 _PyEval_ImportName(PyThreadState *tstate, _PyInterpreterFrame *frame,
+            PyObject *name, PyObject *fromlist, PyObject *level)
+{
+    if (!_PyRestricted_Active(tstate)) {
+        return import_name_impl(tstate, frame, name, fromlist, level);
+    }
+    if (!PyLong_Check(level) || PyLong_AsLong(level) != 0) {
+        if (!PyErr_Occurred()) {
+            PyErr_SetString(PyExc_ImportError, "not in dialect: a relative import");
+        }
+        return NULL;
+    }
+    if (_PyRestricted_CheckImport(name) < 0) {
+        return NULL;
+    }
+    _PyRestrictedSaved saved = _PyRestricted_Lift(tstate);
+    PyObject *res = import_name_impl(tstate, frame, name, fromlist, level);
+    _PyRestricted_Restore(tstate, saved);
+    return res;
+}
+
+static PyObject *
+import_name_impl(PyThreadState *tstate, _PyInterpreterFrame *frame,
             PyObject *name, PyObject *fromlist, PyObject *level)
 {
     PyObject *import_func;

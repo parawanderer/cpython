@@ -1,6 +1,7 @@
 /* Abstract Object Interface (many thanks to Jim Fulton) */
 
 #include "Python.h"
+#include "pycore_restricted.h"     // _PyRestricted_Active()
 #include "pycore_abstract.h"      // _PyIndex_Check()
 #include "pycore_call.h"          // _PyObject_CallNoArgs()
 #include "pycore_ceval.h"         // _Py_EnterRecursiveCallTstate()
@@ -155,6 +156,9 @@ PyObject_GetItem(PyObject *o, PyObject *key)
     if (o == NULL || key == NULL) {
         return null_error();
     }
+    if (_PyRestricted_Active(_PyThreadState_GET()) && _PyRestricted_CheckItem(o, 0) < 0) {
+        return NULL;
+    }
 
     PyMappingMethods *m = Py_TYPE(o)->tp_as_mapping;
     if (m && m->mp_subscript) {
@@ -229,6 +233,9 @@ PyObject_SetItem(PyObject *o, PyObject *key, PyObject *value)
         null_error();
         return -1;
     }
+    if (_PyRestricted_Active(_PyThreadState_GET()) && _PyRestricted_CheckItem(o, 1) < 0) {
+        return -1;
+    }
 
     PyMappingMethods *m = Py_TYPE(o)->tp_as_mapping;
     if (m && m->mp_ass_subscript) {
@@ -261,6 +268,9 @@ PyObject_DelItem(PyObject *o, PyObject *key)
 {
     if (o == NULL || key == NULL) {
         null_error();
+        return -1;
+    }
+    if (_PyRestricted_Active(_PyThreadState_GET()) && _PyRestricted_CheckItem(o, 1) < 0) {
         return -1;
     }
 
