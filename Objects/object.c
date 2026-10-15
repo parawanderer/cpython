@@ -1294,8 +1294,16 @@ PyObject_GetAttr(PyObject *v, PyObject *name)
                      Py_TYPE(name)->tp_name);
         return NULL;
     }
-    if (_PyRestricted_Active(_PyThreadState_GET()) && _PyRestricted_CheckGetAttr(v, name) < 0) {
-        return NULL;
+    if (_PyRestricted_Active(_PyThreadState_GET())) {
+        int g = _PyRestricted_CheckGetAttr(v, name);
+        if (g < 0) {
+            return NULL;
+        }
+        if (g > 0) {    /* a kind's dynamic rule admitted it: read it lifted */
+            PyObject *lifted;
+            (void)_PyRestricted_ReadAttrLifted(v, name, &lifted);
+            return lifted;
+        }
     }
 
     PyObject* result = NULL;
@@ -1333,9 +1341,22 @@ PyObject_GetOptionalAttr(PyObject *v, PyObject *name, PyObject **result)
         *result = NULL;
         return -1;
     }
-    if (_PyRestricted_Active(_PyThreadState_GET()) && _PyRestricted_CheckGetAttr(v, name) < 0) {
-        *result = NULL;
-        return -1;
+    if (_PyRestricted_Active(_PyThreadState_GET())) {
+        int g = _PyRestricted_CheckGetAttr(v, name);
+        if (g < 0) {
+            *result = NULL;
+            return -1;
+        }
+        if (g > 0) {
+            if (_PyRestricted_ReadAttrLifted(v, name, result) < 0) {
+                if (PyErr_ExceptionMatches(PyExc_AttributeError)) {
+                    PyErr_Clear();
+                    return 0;
+                }
+                return -1;
+            }
+            return 1;
+        }
     }
 
     if (tp->tp_getattro == PyObject_GenericGetAttr) {
@@ -1589,8 +1610,15 @@ _PyObject_GetMethod(PyObject *obj, PyObject *name, PyObject **method)
     int meth_found = 0;
 
     assert(*method == NULL);
-    if (_PyRestricted_Active(_PyThreadState_GET()) && _PyRestricted_CheckGetAttr(obj, name) < 0) {
-        return 0;
+    if (_PyRestricted_Active(_PyThreadState_GET())) {
+        int g = _PyRestricted_CheckGetAttr(obj, name);
+        if (g < 0) {
+            return 0;
+        }
+        if (g > 0) {
+            (void)_PyRestricted_ReadAttrLifted(obj, name, method);
+            return 0;
+        }
     }
 
     PyTypeObject *tp = Py_TYPE(obj);
