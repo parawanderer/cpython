@@ -156,8 +156,18 @@ PyObject_GetItem(PyObject *o, PyObject *key)
     if (o == NULL || key == NULL) {
         return null_error();
     }
-    if (_PyRestricted_Active(_PyThreadState_GET()) && _PyRestricted_CheckItem(o, 0) < 0) {
-        return NULL;
+    PyThreadState *rtstate = _PyThreadState_GET();
+    if (_PyRestricted_Active(rtstate)) {
+        int lift = _PyRestricted_CheckItem(o, 0);
+        if (lift < 0) {
+            return NULL;
+        }
+        if (lift) {
+            _PyRestrictedSaved saved = _PyRestricted_Lift(rtstate);
+            PyObject *res = PyObject_GetItem(o, key);
+            _PyRestricted_Restore(rtstate, saved);
+            return res;
+        }
     }
 
     PyMappingMethods *m = Py_TYPE(o)->tp_as_mapping;
@@ -233,8 +243,18 @@ PyObject_SetItem(PyObject *o, PyObject *key, PyObject *value)
         null_error();
         return -1;
     }
-    if (_PyRestricted_Active(_PyThreadState_GET()) && _PyRestricted_CheckItem(o, 1) < 0) {
-        return -1;
+    PyThreadState *rtstate = _PyThreadState_GET();
+    if (_PyRestricted_Active(rtstate)) {
+        int lift = _PyRestricted_CheckItem(o, 1);
+        if (lift < 0) {
+            return -1;
+        }
+        if (lift) {
+            _PyRestrictedSaved saved = _PyRestricted_Lift(rtstate);
+            int res = PyObject_SetItem(o, key, value);
+            _PyRestricted_Restore(rtstate, saved);
+            return res;
+        }
     }
 
     PyMappingMethods *m = Py_TYPE(o)->tp_as_mapping;
@@ -270,8 +290,18 @@ PyObject_DelItem(PyObject *o, PyObject *key)
         null_error();
         return -1;
     }
-    if (_PyRestricted_Active(_PyThreadState_GET()) && _PyRestricted_CheckItem(o, 1) < 0) {
-        return -1;
+    PyThreadState *rtstate = _PyThreadState_GET();
+    if (_PyRestricted_Active(rtstate)) {
+        int lift = _PyRestricted_CheckItem(o, 1);
+        if (lift < 0) {
+            return -1;
+        }
+        if (lift) {
+            _PyRestrictedSaved saved = _PyRestricted_Lift(rtstate);
+            int res = PyObject_DelItem(o, key);
+            _PyRestricted_Restore(rtstate, saved);
+            return res;
+        }
     }
 
     PyMappingMethods *m = Py_TYPE(o)->tp_as_mapping;
