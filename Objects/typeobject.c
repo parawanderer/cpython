@@ -17,6 +17,7 @@
 #include "pycore_pyatomic_ft_wrappers.h"
 #include "pycore_pyerrors.h"      // _PyErr_Occurred()
 #include "pycore_pystate.h"       // _PyThreadState_GET()
+#include "pycore_restricted.h"    // _PyRestricted_LiftsDunders()
 #include "pycore_symtable.h"      // _Py_Mangle()
 #include "pycore_typeobject.h"    // struct type_cache
 #include "pycore_unicodeobject.h" // _PyUnicode_Copy
@@ -2883,6 +2884,8 @@ static inline PyObject*
 vectorcall_unbound(PyThreadState *tstate, int unbound, PyObject *func,
                    PyObject *const *args, Py_ssize_t nargs)
 {
+    PyObject *self = args[0];
+    PyObject *const *self_args = args;
     size_t nargsf = nargs;
     if (!unbound) {
         /* Skip self argument, freeing up args[0] to use for
@@ -2891,12 +2894,29 @@ vectorcall_unbound(PyThreadState *tstate, int unbound, PyObject *func,
         nargsf = nargsf - 1 + PY_VECTORCALL_ARGUMENTS_OFFSET;
     }
     EVAL_CALL_STAT_INC_IF_FUNCTION(EVAL_CALL_SLOT, func);
+    /* window.ml restricted mode: a dunder of a kind that lists "__^" runs lifted (pycore_restricted.h). */
+    if (_PyRestricted_Active(tstate) && _PyRestricted_LiftsDunders(self)) {
+        if (_PyRestricted_CheckCrossing(self_args + 1, nargs - 1) < 0) {
+            return NULL;
+        }
+        _PyRestrictedSaved saved = _PyRestricted_Lift(tstate);
+        PyObject *res = _PyObject_VectorcallTstate(tstate, func, args, nargsf, NULL);
+        _PyRestricted_Restore(tstate, saved);
+        return res;
+    }
     return _PyObject_VectorcallTstate(tstate, func, args, nargsf, NULL);
 }
 
 static PyObject*
 call_unbound_noarg(int unbound, PyObject *func, PyObject *self)
 {
+    PyThreadState *tstate = _PyThreadState_GET();
+    if (_PyRestricted_Active(tstate) && _PyRestricted_LiftsDunders(self)) {
+        _PyRestrictedSaved saved = _PyRestricted_Lift(tstate);
+        PyObject *res = unbound ? PyObject_CallOneArg(func, self) : _PyObject_CallNoArgs(func);
+        _PyRestricted_Restore(tstate, saved);
+        return res;
+    }
     if (unbound) {
         return PyObject_CallOneArg(func, self);
     }
@@ -2933,11 +2953,25 @@ call_method(PyObject *self, PyObject *attr, PyObject *args, PyObject *kwds)
     int unbound = lookup_method(self, attr, &cref.ref);
     if (unbound >= 0) {
         PyObject *meth = PyStackRef_AsPyObjectBorrow(cref.ref);
+        int lift = _PyRestricted_Active(tstate) && _PyRestricted_LiftsDunders(self);
+        if (lift && args != NULL && PyTuple_Check(args)
+            && _PyRestricted_CheckCrossing(&PyTuple_GET_ITEM(args, 0), PyTuple_GET_SIZE(args)) < 0)
+        {
+            _PyThreadState_PopCStackRef(tstate, &cref);
+            return NULL;
+        }
+        _PyRestrictedSaved saved;
+        if (lift) {
+            saved = _PyRestricted_Lift(tstate);
+        }
         if (unbound) {
             res = _PyObject_Call_Prepend(tstate, meth, self, args, kwds);
         }
         else {
             res = _PyObject_Call(tstate, meth, args, kwds);
+        }
+        if (lift) {
+            _PyRestricted_Restore(tstate, saved);
         }
     }
     _PyThreadState_PopCStackRef(tstate, &cref);

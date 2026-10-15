@@ -15,13 +15,16 @@ import _restricted
 
 NotInDialect = _restricted.NotInDialect
 
-__all__ = ["compile_cell", "run_cell", "mark", "load_manifests", "CO_RESTRICTED", "DEFAULT_BUDGET", "MAX_COLLECTION"]
+__all__ = ["compile_cell", "run_cell", "mark", "load_manifests", "CO_RESTRICTED", "DEFAULT_BUDGET", "DEFAULT_MEMORY",
+           "MAX_COLLECTION"]
 
 CO_RESTRICTED = _restricted.CO_RESTRICTED
 # Steps a run gets when the caller names none. A step is one periodic check (a backward jump or a call), so it is far
 # coarser than the JS dialect's AST-node step; the number is calibrated to the same TIME, about a second of interpreter
 # work (Lib/test/test_restricted.py, BudgetTest, measures the rate on this build).
 DEFAULT_BUDGET = _restricted.DEFAULT_BUDGET
+# Bytes a run may add to the heap, net: the native form of the JS dialect's size caps (MAX_STRING, MAX_COLLECTION).
+DEFAULT_MEMORY = _restricted.DEFAULT_MEMORY
 # The longest range a program may build: a C consumer (sum, max, sorted, list) walks it with no step the budget can
 # see, so its length is what bounds that call's cost (the JS dialect's MAX_COLLECTION).
 MAX_COLLECTION = 1_000_000
@@ -125,10 +128,11 @@ def _top_targets(stmt):
     return out
 
 
-def run_cell(source, namespace, nodes=DEFAULT_NODES, budget=None, depth=None):
+def run_cell(source, namespace, nodes=DEFAULT_NODES, budget=None, depth=None, memory=None):
     """Check, compile and run a cell in ``namespace`` (a dict) with the thread restricted; return the cell's value.
-    ``budget`` is the step budget (DEFAULT_BUDGET when None), ``depth`` the deepest the cell's own frames may nest."""
-    _restricted.run(compile_cell(source, nodes=nodes), namespace, budget, depth)
+    ``budget`` is the step budget (DEFAULT_BUDGET when None), ``depth`` the deepest the cell's own frames may nest,
+    ``memory`` the bytes the cell may add to the heap (DEFAULT_MEMORY)."""
+    _restricted.run(compile_cell(source, nodes=nodes), namespace, budget, depth, memory)
     namespace.pop("_user", None)
     return namespace.pop("__cell_result__", None)
 
@@ -170,15 +174,24 @@ def own_function(f):
     return type(f) is types.FunctionType and bool(f.__code__.co_flags & CO_RESTRICTED)
 
 
-def entry_check(name, method):
+def entry_check(name, method, arguments=True):
     """The checker for a lifted leaf named `name`: run before the leaf, with its arguments. For a METHOD the gate may
     see the plain function with the receiver as the first argument (a method call's LOAD_ATTR hands CALL the unbound
-    function), so the receiver is dropped before the arguments are judged."""
+    function), so the receiver is split off before the arguments are judged. ``arguments``: judge the callables and
+    the names (the leaves in _ENTRY_CHECKED). A method also gets the WRITE check: ``inplace=True``, or a method that
+    writes its receiver (_MUTATES_SELF), needs a receiver the cell owns."""
     names_position = name in _NAME_POSITION
+    writes_self = name in _MUTATES_SELF
 
     def check(func, self, args, kwargs):
-        if method and self is None:
-            args = args[1:]
+        if method:
+            if self is None:
+                self, args = (args[0] if args else None), args[1:]
+            if (writes_self or (kwargs or {}).get("inplace")) and not _restricted.owned(self):
+                raise NotInDialect(f"not in dialect: {name}() writes a value the cell does not own "
+                                   f"({type(self).__name__})")
+        if not arguments:
+            return
         given = list(args) + list((kwargs or {}).values())
         for i, a in enumerate(given):
             for x in _walk(a):
@@ -192,6 +205,26 @@ def entry_check(name, method):
                     if isinstance(x, str) and x not in VOCABULARY:
                         raise NotInDialect(f"not in dialect: {name}({x!r}) names a method outside the vocabulary")
     return check
+
+
+# OWNERSHIP (slice 5). Methods that write their receiver: read only off a value the cell owns (the gate refuses the
+# attribute itself otherwise, so no bound one exists to hand to a C loop).
+MUTATORS = {
+    list: ["append", "extend", "insert", "pop", "remove", "sort", "reverse", "clear"],
+    dict: ["update", "pop", "popitem", "setdefault", "clear"],
+    set: ["add", "discard", "remove", "pop", "update", "clear", "difference_update", "intersection_update",
+          "symmetric_difference_update"],
+    bytearray: ["append", "extend", "insert", "pop", "remove", "reverse", "clear"],
+}
+# pandas methods that write their receiver whatever their arguments (others only with inplace=True).
+_MUTATES_SELF = {"update", "insert", "pop"}
+# Lifted leaves whose result is a NEW value, owned by the cell: a STAND-IN until the manifests' second pass carries
+# return marking (fresh / alias(i) / internal). Only calls that always build a new object; a reshape, a column, .values
+# and every other view stay unowned. The gate also refuses the marking when the result IS the receiver or an argument.
+_FRESH = {"numpy": {"array", "zeros", "ones", "arange"}, "pandas": {"DataFrame", "Series", "concat", "to_numeric"},
+          ("numpy", "ndarray"): {"copy"}, ("pandas", "DataFrame"): {"copy"}, ("pandas", "Series"): {"copy"}}
+
+
 # Effects outside heap(owned): never lifted, never listed, until the manifest's effects pass says how.
 _EFFECTFUL = {"read_csv", "read_html", "read_json", "read_excel", "read_parquet", "read_pickle", "to_pickle",
               "to_csv", "to_parquet", "to_excel", "to_json", "to_html", "to_sql", "info"}
@@ -205,6 +238,93 @@ def _range_cost(func, self, args, kwargs):
         n = MAX_COLLECTION + 1
     if n > MAX_COLLECTION:
         raise NotInDialect(f"not in dialect: a range of more than {MAX_COLLECTION} elements")
+
+
+def risky_regex(source):
+    """Why a regex could backtrack exponentially, or None: a REPEATED group that itself contains a quantifier or an
+    alternation ((a+)+, (\\w+\\s?)*, (a|a)+). sre is C with no match timeout, so one match of such a pattern on a
+    40-character string runs for hours in a single call the budget never sees. Conservative by design, as the JS
+    dialect's riskyRegex (src/readonly-exec/limits.ts), of which this is a port: (?:x|y)+ is refused with the rest."""
+    import re
+    stack = []              # one frame per open group: [has a quantifier inside, has an alternation inside]
+
+    def is_repeat(i):
+        if i >= len(source):
+            return False
+        c = source[i]
+        if c in "*+":
+            return True
+        if c != "{":
+            return False
+        m = re.match(r"\{(\d+)(,(\d*))?\}", source[i:])
+        return bool(m) and ((m.group(3) == "" or int(m.group(3)) > 1) if m.group(2) is not None
+                            else int(m.group(1)) > 1)
+
+    def mark(k):
+        for f in stack:
+            f[k] = True
+
+    i = 0
+    while i < len(source):
+        c = source[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "[":                        # a class is one atom: skip to its close
+            i += 1
+            while i < len(source) and source[i] != "]":
+                i += 2 if source[i] == "\\" else 1
+            i += 1
+            continue
+        if c == "(":
+            stack.append([False, False])
+            if source[i + 1:i + 2] == "?":  # a group's own prefix is syntax, not a quantifier
+                if source[i + 2:i + 3] == "<" and source[i + 3:i + 4] not in ("=", "!"):
+                    i = source.find(">", i)
+                    if i < 0:
+                        return None
+                else:
+                    i += 3 if source[i + 2:i + 3] == "<" else 2
+            i += 1
+            continue
+        if c == "|":
+            mark(1)
+            i += 1
+            continue
+        if c == ")":
+            g = stack.pop() if stack else None
+            if g is not None and is_repeat(i + 1) and (g[0] or g[1]):
+                return ("a repeated group that contains a quantifier" if g[0]
+                        else "a repeated group that contains an alternation")
+            if g is not None and is_repeat(i + 1):
+                mark(0)
+            i += 1
+            continue
+        if is_repeat(i) or c == "?":
+            mark(0)
+        i += 1
+    return None
+
+
+# re's functions: lifted leaves (sre is C; re's own Python resolves nothing from its arguments) behind a check that the
+# pattern cannot backtrack exponentially, and the callback rule for a callable `repl`.
+_REGEX = ("compile", "search", "match", "fullmatch", "findall", "finditer", "sub", "subn", "split")
+
+
+def regex_check(name):
+    arguments = entry_check(name, False)
+
+    def check(func, self, args, kwargs):
+        pattern = args[0] if args else (kwargs or {}).get("pattern")
+        if isinstance(pattern, bytes):
+            pattern = pattern.decode("latin-1")
+        if not isinstance(pattern, str):
+            raise NotInDialect(f"not in dialect: re.{name}() needs a pattern string")
+        why = risky_regex(pattern)
+        if why:
+            raise NotInDialect(f"not in dialect: re.{name}({pattern!r}) could backtrack exponentially ({why})")
+        arguments(func, self, args, kwargs)
+    return check
 
 
 def load_manifests(data_dir):
@@ -233,11 +353,18 @@ def load_manifests(data_dir):
         _restricted.allow_kind(containers[kind], names)
         done["kinds"][kind] = names
     _restricted.allow_kind(range, ["[]"])
+    for t, names in MUTATORS.items():
+        _restricted.allow_mutators(t, names)
 
     stdlib = data("manifest-stdlib.json")
     for mod, names in stdlib["modules"].items():
         _restricted.allow_module(mod, names)
         done["modules"][mod] = names
+    import re
+    for name in stdlib["modules"].get("re", []):
+        if name in _REGEX:
+            _restricted.allow_call(getattr(re, name), True, regex_check(name))
+            done["lifted"].append(f"re.{name}")
     for mod in wl["modules"]:
         if mod not in done["modules"] and mod not in ("pandas", "numpy", "PIL"):
             _restricted.allow_module(mod, [])
@@ -256,6 +383,8 @@ def load_manifests(data_dir):
             f = getattr(mod, fname, None)
             if f is not None and fname not in _OUT:
                 _restricted.allow_call(f, True, entry_check(fname, False) if fname in _ENTRY_CHECKED else None)
+                if fname in _FRESH.get(mod_name, ()):
+                    _restricted.allow_fresh(f)
                 done["lifted"].append(f"{mod_name}.{fname}")
         for kind, names in man["kinds"].items():
             cls = _kind_class(mod_name, kind)
@@ -264,14 +393,24 @@ def load_manifests(data_dir):
             listed = [n for n in names if n not in _EFFECTFUL and n not in _OUT]
             if mod_name == "pandas":    # the checked leaves are listed whatever the corpus count's threshold said
                 listed += [n for n in sorted(_ENTRY_CHECKED) if n not in listed]
-            extra = ["[]", "[]^"] if (mod_name, kind) in (("pandas", "DataFrame"), ("pandas", "Series")) else []
+            # Item writes are listed, and the gate admits them only on an OWNED value (a copy, never the injected
+            # frame or a view of it).
+            extra = (["[]", "[]=", "[]^"] if (mod_name, kind) in (("pandas", "DataFrame"), ("pandas", "Series"))
+                     else ["[]", "[]="] if (mod_name, kind) == ("numpy", "ndarray") else [])
+            if mod_name == "pandas":
+                # pandas' dunders (__len__, __add__, __eq__, __iter__) are Python: reached through a type slot they run
+                # lifted, as its listed methods do, after the gate's own barrier for the operation.
+                extra.append("__^")
             for c in (cls if isinstance(cls, tuple) else (cls,)):
                 present = [n for n in listed if hasattr(c, n)]
                 _restricted.allow_kind(c, present + extra)
+                _restricted.allow_mutators(c, [n for n in present if n in _MUTATES_SELF])
                 for n in present:
                     f = _static_function(c, n)
                     if f is not None:
-                        _restricted.allow_call(f, True, entry_check(n, True) if n in _ENTRY_CHECKED else None)
+                        _restricted.allow_call(f, True, entry_check(n, True, arguments=n in _ENTRY_CHECKED))
+                        if n in _FRESH.get((mod_name, kind), ()):
+                            _restricted.allow_fresh(f)
                         done["lifted"].append(f"{c.__name__}.{n}")
             if (mod_name, kind) == ("pandas", "DataFrame"):
                 # dynamic: columns (ruled). Ours, not pandas' __getattr__; never a name the class itself has.
