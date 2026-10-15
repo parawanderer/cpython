@@ -140,7 +140,7 @@ def _child():
     before = _snapshot(ns) if msg.get("leaves_nothing") else None
     out = {"kind": "ran"}
     try:
-        v = restricted.run_cell(msg["py"], ns)
+        v = restricted.run_cell(msg["py"], ns, budget=msg.get("budget"))
         out["returned"] = True
         out["value"] = _plain(v)
     except BaseException as e:
@@ -198,7 +198,8 @@ def _run_one(genre, vec, args):
     if "budget" in vec:
         row["budget"] = vec["budget"]
     msg = {"data": os.path.abspath(args.data), "env": vec["env"], "py": vec["py"],
-           "pre": (vec.get("pre") or {}).get("py"), "leaves_nothing": bool(vec.get("leaves_nothing"))}
+           "pre": (vec.get("pre") or {}).get("py"), "leaves_nothing": bool(vec.get("leaves_nothing")),
+           "budget": vec.get("budget")}     # None: the build's DEFAULT_BUDGET
     if vec.get("pre") and not msg["pre"]:
         msg["pre"] = None
     t0 = time.time()
@@ -218,8 +219,6 @@ def _run_one(genre, vec, args):
             except Exception as e:
                 row.update(status="ERROR", reason=f"bad child reply: {e}: {p.stdout[:80]!r}")
     row["seconds"] = round(time.time() - t0, 2)
-    if "budget" in vec:
-        row["reason"] = f"[budget {vec['budget']} not implemented] " + row["reason"]
     return row
 
 

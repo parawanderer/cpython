@@ -314,5 +314,149 @@ class GateTest(unittest.TestCase):
         self.refused("return lift(list, map(lambda x: lift(list, map(lambda y: y.secret, [x])), [box]))", box=Box())
 
 
+def swallow(f, *args):
+    """Host code that catches everything, the way pandas' fallbacks do: registered as a LIFTED leaf."""
+    try:
+        return f(*args)
+    except Exception:
+        return "swallowed"
+
+
+def each(f, n):
+    """Host code that calls a callback n times (a C leaf's loop, from the budget's side)."""
+    for i in range(n):
+        f(i)
+    return n
+
+
+class BudgetTest(unittest.TestCase):
+    """Slice 4: the step budget at the eval breaker, the depth, a C loop's cost bounded before it runs, and a refusal
+    that library code catches still refusing the run."""
+
+    LOOP = "n = 0\nfor i in range(100):\n    n += i\nreturn n"
+
+    def setUp(self):
+        for f in (len, sum, max, list, abs):
+            _restricted.allow_call(f, False)
+        _restricted.allow_call(range, False, restricted._range_cost)
+        _restricted.allow_kind(list, ["append", "[]", "[]="])
+        _restricted.allow_kind(str, ["format"])
+        _restricted.allow_call(swallow, True)
+        _restricted.allow_call(each, True)
+
+    def tearDown(self):
+        _restricted.reset()
+
+    def run_cell(self, src, budget=None, depth=None, **names):
+        ns = dict(names, swallow=swallow, each=each)
+        return restricted.run_cell(src, ns, budget=budget, depth=depth)
+
+    def refused(self, src, match, **kw):
+        with self.assertRaisesRegex(_restricted.NotInDialect, match, msg=src):
+            self.run_cell(src, **kw)
+        self.assertFalse(_restricted.active(), "a refusal restores the thread state")
+
+    # --- the step budget ---
+
+    def test_a_bounded_loop_runs_out(self):
+        self.refused(self.LOOP, "step budget", budget=50)
+        self.assertEqual(_restricted.steps(), 51)
+
+    def test_the_same_loop_under_enough_budget(self):
+        self.assertEqual(self.run_cell(self.LOOP, budget=500), 4950)
+        self.assertGreaterEqual(_restricted.steps(), 100)
+        self.assertLess(_restricted.steps(), 120)
+
+    def test_a_list_that_grows_while_it_is_iterated(self):
+        self.refused("xs = [1]\nfor x in xs:\n    xs.append(x)\nreturn len(xs)", "step budget", budget=200_000)
+
+    def test_a_nested_comprehension(self):
+        self.refused("return len([i * j for i in range(10 ** 5) for j in range(10 ** 5)])", "step budget",
+                     budget=200_000)
+
+    def test_calls_are_charged(self):
+        self.refused("def f(x):\n    return x\nreturn [f(1), f(2), f(3), f(4)]", "step budget", budget=3)
+
+    def test_a_callback_from_a_lifted_leaf_is_charged(self):
+        self.refused("return each(lambda i: i, 1000)", "step budget", budget=200)
+
+    def test_no_budget_means_the_default(self):
+        self.assertEqual(self.run_cell(self.LOOP), 4950)
+        self.assertEqual(restricted.DEFAULT_BUDGET, _restricted.DEFAULT_BUDGET)
+        with self.assertRaises(ValueError):
+            self.run_cell(self.LOOP, budget=-1)
+
+    def test_the_default_is_about_a_second(self):
+        import time
+        t = time.perf_counter()
+        self.run_cell("n = 0\nfor i in range(1000000):\n    n += i\nreturn n", budget=2_000_000)
+        rate = _restricted.steps() / (time.perf_counter() - t)
+        seconds = restricted.DEFAULT_BUDGET / rate
+        # Broad, for a loaded machine: the point is the order of magnitude (the JS dialect's budget is ~1 s).
+        self.assertGreater(seconds, 0.1, f"{rate:.0f} steps/s")
+        self.assertLess(seconds, 10, f"{rate:.0f} steps/s")
+
+    def test_the_budget_ends_with_the_run(self):
+        f = self.run_cell("def f(n):\n    t = 0\n    for i in range(n):\n        t += i\n    return t\nreturn f",
+                          budget=100)
+        self.assertEqual(f(1000), 499500, "a restricted def called outside a run is neither gated nor metered")
+        self.refused(self.LOOP, "step budget", budget=50)
+        self.assertEqual(self.run_cell(self.LOOP, budget=500), 4950, "an exhausted budget does not leak to the next")
+
+    def test_exhaustion_is_sticky(self):
+        # The first refusal is swallowed by host code; the cell loops on, meets the budget again, and is refused.
+        self.refused("swallow(lambda: [i for i in range(1000)])\nreturn [i for i in range(1000)]", "step budget",
+                     budget=100)
+
+    # --- a refusal library code catches ---
+
+    def test_a_swallowed_budget_refusal_still_refuses(self):
+        # Refused at the next periodic check after the swallow (sticky), or by run() at the end: either way, refused.
+        self.refused("return swallow(lambda: [i for i in range(1000)])", "step budget|caught by library code",
+                     budget=100)
+
+    def test_a_swallowed_gate_refusal_still_refuses(self):
+        self.refused("return swallow(lambda: '{0.__class__}'.format(1))", "caught by library code")
+
+    def test_an_unrefused_swallow_is_a_value(self):
+        self.assertEqual(self.run_cell("return swallow(lambda: 1 // 0)"), "swallowed")
+
+    # --- the depth ---
+
+    def test_recursion_past_the_depth(self):
+        self.refused("def f(n):\n    return f(n + 1)\nreturn f(0)", "depth")
+
+    def test_mutual_recursion_past_the_depth(self):
+        self.refused("def a(n):\n    return b(n + 1)\ndef b(n):\n    return a(n + 1)\nreturn a(0)", "depth")
+
+    def test_recursion_within_the_depth(self):
+        self.assertEqual(self.run_cell("def f(n):\n    return 0 if n == 0 else 1 + f(n - 1)\nreturn f(200)"), 200)
+
+    def test_a_smaller_depth(self):
+        src = "def f(n):\n    return 0 if n == 0 else 1 + f(n - 1)\nreturn f(20)"
+        self.refused(src, "depth", depth=10)
+        self.assertEqual(self.run_cell(src, depth=30), 20)
+
+    def test_the_refusal_is_not_a_recursion_error(self):
+        try:
+            self.run_cell("def f(n):\n    return f(n + 1)\nreturn f(0)")
+        except _restricted.NotInDialect:
+            pass
+        except RecursionError:
+            self.fail("CPython's own limit was reached before the dialect's depth")
+
+    # --- a C loop's cost, bounded before it runs ---
+
+    def test_a_sum_over_a_huge_range(self):
+        self.refused("return sum(range(10 ** 12))", "range of more than")
+
+    def test_a_range_too_big_to_measure(self):
+        self.refused("return max(range(10 ** 30))", "range of more than")
+
+    def test_a_range_at_the_cap(self):
+        self.assertEqual(self.run_cell(f"return len(range({restricted.MAX_COLLECTION}))"), restricted.MAX_COLLECTION)
+        self.refused(f"return len(range(-1, {restricted.MAX_COLLECTION}))", "range of more than")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -91,6 +91,10 @@ extern PyObject *_PyRestricted_Vectorcall(PyThreadState *tstate, PyObject *calla
                                           size_t nargsf, PyObject *kwnames);
 extern PyObject *_PyRestricted_Call(PyThreadState *tstate, PyObject *callable, PyObject *args, PyObject *kwargs);
 
+/* The step budget and the depth, charged at every periodic check while _PY_EVAL_RESTRICTED_BIT is set (the extent of
+   _restricted.run()). Returns 0, or -1 with NotInDialect set. */
+extern int _PyRestricted_Tick(PyThreadState *tstate);
+
 /* Registration, host-only (Modules/_restrictedmodule.c). */
 PyAPI_FUNC(int) _PyRestricted_AllowKind(PyObject *type, PyObject *names);
 PyAPI_FUNC(int) _PyRestricted_AllowModule(PyObject *name, PyObject *names);
