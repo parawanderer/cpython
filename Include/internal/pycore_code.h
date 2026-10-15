@@ -287,8 +287,14 @@ extern void _PyCode_Clear_Executors(PyCodeObject *code);
 // thread-safe.
 #define ENABLE_SPECIALIZATION_FT 1
 #else
-#define ENABLE_SPECIALIZATION 1
-#define ENABLE_SPECIALIZATION_FT ENABLE_SPECIALIZATION
+// window.ml restricted mode (option C, repl-specs 2026-10-15): the gate lives in the abstract object layer, and a
+// specialized instruction does its access inline without calling it. With specialization off, every attribute, item
+// and call goes through the generic instruction and so through the gate.
+#define ENABLE_SPECIALIZATION 0
+#define ENABLE_SPECIALIZATION_FT 0
+#endif
+#if defined(_Py_JIT) || defined(_Py_TIER2)
+#  error "window.ml restricted mode: tier 2 and the JIT bypass the abstract-layer gate; build without them"
 #endif
 
 /* Specialization functions */

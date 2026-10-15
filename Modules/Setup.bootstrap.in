@@ -12,6 +12,7 @@ posix posixmodule.c
 _signal signalmodule.c
 _tracemalloc _tracemalloc.c
 _suggestions _suggestions.c
+_restricted _restrictedmodule.c
 # needs libm and on some platforms librt
 _datetime _datetimemodule.c
 
