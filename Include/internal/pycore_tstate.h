@@ -44,6 +44,17 @@ typedef struct _PyThreadStateImpl {
     int restricted;
     int restricted_lifted;
     struct _PyInterpreterFrame *restricted_barrier;
+    // The step budget and the depth, for the extent of _restricted.run(); counted where the eval breaker is checked
+    // (backward jumps, calls), through _PY_EVAL_RESTRICTED_BIT, so they cost nothing outside a run.
+    // restricted_steps: steps left (negative once exhausted, and it stays exhausted: every later check refuses).
+    // restricted_depth_base: py_recursion_remaining when the run began; restricted_depth_limit: the deepest a
+    // CO_RESTRICTED frame may sit above it. restricted_tripped: a refusal happened during this run (so library code that
+    // caught it cannot turn it into a value).
+    long long restricted_steps;
+    long long restricted_budget;
+    int restricted_depth_base;
+    int restricted_depth_limit;
+    int restricted_tripped;
 
     PyObject *asyncio_running_loop; // Strong reference
     PyObject *asyncio_running_task; // Strong reference

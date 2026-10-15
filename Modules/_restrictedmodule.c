@@ -14,16 +14,31 @@
 #include "Python.h"
 #include "pycore_code.h"        // ENABLE_SPECIALIZATION
 #include "pycore_restricted.h"  // _PyRestricted_Active()
+#include "pycore_ceval.h"        // _PY_EVAL_RESTRICTED_BIT
 #include "pycore_pystate.h"      // _PyThreadState_GET()
 #include "pycore_tstate.h"      // _PyThreadStateImpl
 
-/* run(code, globals, /): evaluate a CO_RESTRICTED code object in `globals`, with the thread restricted for the call.
-   The previous state is restored on every exit, an exception included, because this is a C call. */
+/* The step budget a run gets when the caller names none: about a second of interpreter work (measured: see
+   DEFAULT_BUDGET in Lib/restricted.py), the same bound the JS dialect's STEP_BUDGET sets. */
+#define RESTRICTED_DEFAULT_BUDGET 15000000LL
+/* How deep a program's own frames may sit above where the run began, in Python frames (the JS dialect's
+   MAX_CALL_DEPTH). */
+#define RESTRICTED_DEFAULT_DEPTH 256
+/* Frames left below the depth for CPython's own limit, so the dialect's refusal comes before a RecursionError. */
+#define RESTRICTED_DEPTH_MARGIN 50
+
+static long long last_used;
+static PyObject *not_in_dialect;  /* borrowed: the module keeps it alive; set at init */     /* steps the last finished run used (one interpreter per process, as the gate) */
+
+/* run(code, globals, budget=None, depth=None, /): evaluate a CO_RESTRICTED code object in `globals`, with the thread
+   restricted, metered and depth-bounded for the call. The previous state is restored on every exit, an exception
+   included, because this is a C call. A run during which anything was refused ends in NotInDialect, however it ended:
+   library code that caught the refusal cannot turn it into a value. */
 static PyObject *
 restricted_run(PyObject *module, PyObject *const *args, Py_ssize_t nargs)
 {
-    if (nargs != 2) {
-        PyErr_SetString(PyExc_TypeError, "run() takes exactly 2 arguments (code, globals)");
+    if (nargs < 2 || nargs > 4) {
+        PyErr_SetString(PyExc_TypeError, "run() takes 2 to 4 arguments (code, globals, budget=None, depth=None)");
         return NULL;
     }
     PyObject *code = args[0], *globals = args[1];
@@ -39,17 +54,90 @@ restricted_run(PyObject *module, PyObject *const *args, Py_ssize_t nargs)
         PyErr_SetString(PyExc_TypeError, "run() needs a dict of globals");
         return NULL;
     }
-    _PyThreadStateImpl *ts = (_PyThreadStateImpl *)_PyThreadState_GET();
-    int saved = ts->restricted, saved_lifted = ts->restricted_lifted;
-    struct _PyInterpreterFrame *saved_barrier = ts->restricted_barrier;
+    long long budget = RESTRICTED_DEFAULT_BUDGET;
+    long depth = RESTRICTED_DEFAULT_DEPTH;
+    if (nargs > 2 && args[2] != Py_None) {
+        budget = PyLong_AsLongLong(args[2]);
+        if (budget == -1 && PyErr_Occurred()) {
+            return NULL;
+        }
+        if (budget < 0) {
+            PyErr_SetString(PyExc_ValueError, "run() needs a budget >= 0");
+            return NULL;
+        }
+    }
+    if (nargs > 3 && args[3] != Py_None) {
+        depth = PyLong_AsLong(args[3]);
+        if (depth == -1 && PyErr_Occurred()) {
+            return NULL;
+        }
+        if (depth < 1) {
+            PyErr_SetString(PyExc_ValueError, "run() needs a depth >= 1");
+            return NULL;
+        }
+    }
+    PyThreadState *tstate = _PyThreadState_GET();
+    _PyThreadStateImpl *ts = (_PyThreadStateImpl *)tstate;
+    int room = tstate->py_recursion_remaining - RESTRICTED_DEPTH_MARGIN;
+    if (depth > room) {
+        depth = room > 1 ? room : 1;
+    }
+
+    _PyRestrictedSaved saved = {ts->restricted, ts->restricted_lifted, ts->restricted_barrier};
+    long long saved_steps = ts->restricted_steps, saved_budget = ts->restricted_budget;
+    int saved_base = ts->restricted_depth_base, saved_limit = ts->restricted_depth_limit;
+    int saved_tripped = ts->restricted_tripped;
+    int was_metered = (_Py_atomic_load_uintptr_relaxed(&tstate->eval_breaker) & _PY_EVAL_RESTRICTED_BIT) != 0;
+
     ts->restricted = 1;
     ts->restricted_lifted = 0;
     ts->restricted_barrier = NULL;
+    ts->restricted_steps = budget;
+    ts->restricted_budget = budget;
+    ts->restricted_depth_base = tstate->py_recursion_remaining;
+    ts->restricted_depth_limit = (int)depth;
+    ts->restricted_tripped = 0;
+    _Py_set_eval_breaker_bit(tstate, _PY_EVAL_RESTRICTED_BIT);
+
     PyObject *result = PyEval_EvalCode(code, globals, globals);
-    ts->restricted = saved;
-    ts->restricted_lifted = saved_lifted;
-    ts->restricted_barrier = saved_barrier;
+
+    if (!was_metered) {
+        _Py_unset_eval_breaker_bit(tstate, _PY_EVAL_RESTRICTED_BIT);
+    }
+    last_used = ts->restricted_steps < 0 ? budget + 1 : budget - ts->restricted_steps;
+    if (ts->restricted_tripped) {
+        PyObject *exc = PyErr_GetRaisedException();
+        if (exc == NULL || !PyErr_GivenExceptionMatches(exc, not_in_dialect)) {
+            /* Library code caught the refusal and went on (to a value, or to another error). */
+            Py_CLEAR(result);
+            PyErr_SetString(not_in_dialect,
+                            "not in dialect: a refusal during the run was caught by library code");
+            if (exc != NULL) {
+                PyObject *now = PyErr_GetRaisedException();
+                PyException_SetContext(now, exc);   /* steals exc */
+                PyErr_SetRaisedException(now);
+            }
+        }
+        else {
+            PyErr_SetRaisedException(exc);
+        }
+    }
+    ts->restricted = saved.restricted;
+    ts->restricted_lifted = saved.lifted;
+    ts->restricted_barrier = saved.barrier;
+    ts->restricted_steps = saved_steps;
+    ts->restricted_budget = saved_budget;
+    ts->restricted_depth_base = saved_base;
+    ts->restricted_depth_limit = saved_limit;
+    ts->restricted_tripped = saved_tripped;
     return result;
+}
+
+/* steps(): the steps the last finished run used (budget + 1 when it ran out). */
+static PyObject *
+restricted_steps(PyObject *module, PyObject *unused)
+{
+    return PyLong_FromLongLong(last_used);
 }
 
 /* call_lifted(callable, *args): call with the restriction lifted for the call's C extent, the way an approved C leaf
@@ -146,10 +234,8 @@ restricted_allow_call(PyObject *module, PyObject *const *args, Py_ssize_t nargs)
     }
     int lift = nargs >= 2 ? PyObject_IsTrue(args[1]) : 0;
     PyObject *checker = nargs == 3 && args[2] != Py_None ? args[2] : NULL;
-    if (checker != NULL && !lift) {
-        PyErr_SetString(PyExc_ValueError, "an entry checker belongs to a lifted leaf");
-        return NULL;
-    }
+    /* Lifted, the checker is the leaf's ENTRY check; unlifted, it is a COST check (a C loop the budget cannot see,
+       bounded by its arguments). Both run before the call, lifted, and refuse by raising. */
     if (lift < 0 || _PyRestricted_AllowCall(args[0], lift, checker) < 0) {
         return NULL;
     }
@@ -185,13 +271,15 @@ static PyMethodDef restricted_methods[] = {
     {"allow_module", _PyCFunction_CAST(restricted_allow_module), METH_FASTCALL,
      "allow_module(name, names, /)\n--\n\nAllow importing name and reading these of its attributes."},
     {"allow_call", _PyCFunction_CAST(restricted_allow_call), METH_FASTCALL,
-     "allow_call(callable, lift=False, checker=None, /)\n--\n\nAllow calling it from restricted code; lift=True only for a manifest leaf,\nwhose checker(func, self, args, kwargs) runs first."},
+     "allow_call(callable, lift=False, checker=None, /)\n--\n\nAllow calling it from restricted code; lift=True only for a manifest leaf.\nchecker(func, self, args, kwargs) runs first: the leaf's entry check, or an\nunlifted callable's cost check."},
     {"allow_dynamic", _PyCFunction_CAST(restricted_allow_dynamic), METH_FASTCALL,
      "allow_dynamic(type, predicate, /)\n--\n\nAdmit names outside type's table when predicate(obj, name) is true."},
     {"reset", restricted_reset, METH_NOARGS,
      "reset()\n--\n\nForget every allow table."},
     {"run", _PyCFunction_CAST(restricted_run), METH_FASTCALL,
-     "run(code, globals, /)\n--\n\nEvaluate a CO_RESTRICTED code object with the thread restricted."},
+     "run(code, globals, budget=None, depth=None, /)\n--\n\nEvaluate a CO_RESTRICTED code object with the thread restricted, metered by\na step budget and bounded in depth."},
+    {"steps", restricted_steps, METH_NOARGS,
+     "steps()\n--\n\nThe steps the last finished run used (budget + 1 when it ran out)."},
     {"call_lifted", _PyCFunction_CAST(restricted_call_lifted), METH_FASTCALL,
      "call_lifted(callable, *args)\n--\n\nCall with the restriction lifted, as an approved C leaf runs (tests only)."},
     {"active", restricted_active, METH_NOARGS,
@@ -204,6 +292,11 @@ static PyMethodDef restricted_methods[] = {
 static int
 restricted_exec(PyObject *module)
 {
+    if (PyModule_Add(module, "DEFAULT_BUDGET", PyLong_FromLongLong(RESTRICTED_DEFAULT_BUDGET)) < 0
+        || PyModule_AddIntConstant(module, "DEFAULT_DEPTH", RESTRICTED_DEFAULT_DEPTH) < 0)
+    {
+        return -1;
+    }
     if (PyModule_AddIntConstant(module, "CO_RESTRICTED", CO_RESTRICTED) < 0) {
         return -1;
     }
@@ -216,6 +309,7 @@ restricted_exec(PyObject *module)
         return -1;
     }
     _PyRestricted_SetException(exc);
+    not_in_dialect = exc;
     return PyModule_Add(module, "NotInDialect", exc);
 }
 

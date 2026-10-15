@@ -15,9 +15,16 @@ import _restricted
 
 NotInDialect = _restricted.NotInDialect
 
-__all__ = ["compile_cell", "run_cell", "mark", "load_manifests", "CO_RESTRICTED"]
+__all__ = ["compile_cell", "run_cell", "mark", "load_manifests", "CO_RESTRICTED", "DEFAULT_BUDGET", "MAX_COLLECTION"]
 
 CO_RESTRICTED = _restricted.CO_RESTRICTED
+# Steps a run gets when the caller names none. A step is one periodic check (a backward jump or a call), so it is far
+# coarser than the JS dialect's AST-node step; the number is calibrated to the same TIME, about a second of interpreter
+# work (Lib/test/test_restricted.py, BudgetTest, measures the rate on this build).
+DEFAULT_BUDGET = _restricted.DEFAULT_BUDGET
+# The longest range a program may build: a C consumer (sum, max, sorted, list) walks it with no step the budget can
+# see, so its length is what bounds that call's cost (the JS dialect's MAX_COLLECTION).
+MAX_COLLECTION = 1_000_000
 
 
 def mark(code):
@@ -118,9 +125,10 @@ def _top_targets(stmt):
     return out
 
 
-def run_cell(source, namespace, nodes=DEFAULT_NODES):
-    """Check, compile and run a cell in ``namespace`` (a dict) with the thread restricted; return the cell's value."""
-    _restricted.run(compile_cell(source, nodes=nodes), namespace)
+def run_cell(source, namespace, nodes=DEFAULT_NODES, budget=None, depth=None):
+    """Check, compile and run a cell in ``namespace`` (a dict) with the thread restricted; return the cell's value.
+    ``budget`` is the step budget (DEFAULT_BUDGET when None), ``depth`` the deepest the cell's own frames may nest."""
+    _restricted.run(compile_cell(source, nodes=nodes), namespace, budget, depth)
     namespace.pop("_user", None)
     return namespace.pop("__cell_result__", None)
 
@@ -189,6 +197,16 @@ _EFFECTFUL = {"read_csv", "read_html", "read_json", "read_excel", "read_parquet"
               "to_csv", "to_parquet", "to_excel", "to_json", "to_html", "to_sql", "info"}
 
 
+def _range_cost(func, self, args, kwargs):
+    """range's cost check: refused past MAX_COLLECTION elements, before anything walks it."""
+    try:
+        n = len(range(*args, **(kwargs or {})))
+    except OverflowError:
+        n = MAX_COLLECTION + 1
+    if n > MAX_COLLECTION:
+        raise NotInDialect(f"not in dialect: a range of more than {MAX_COLLECTION} elements")
+
+
 def load_manifests(data_dir):
     """Register the gate's allow tables from window-ml's notebooks/python-dialect/data: whitelist.json and the
     manifest-*.json name lists. Returns what it registered, for a runner to report. A baseline for running the
@@ -201,7 +219,7 @@ def load_manifests(data_dir):
     for name in sorted(set(wl["builtins"]) | set(PURE_BUILTINS)):
         f = getattr(builtins, name, None)
         if f is not None and name not in wl["refused_builtins"]:
-            _restricted.allow_call(f, False)
+            _restricted.allow_call(f, False, _range_cost if f is range else None)
             done["calls"].append(name)
     containers = {"str": str, "list": list, "dict": dict, "set": set, "tuple": tuple, "int": int, "float": float}
     for kind, names in wl["builtin_kinds"].items():

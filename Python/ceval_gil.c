@@ -6,6 +6,7 @@
 #include "pycore_pyerrors.h"      // _PyErr_GetRaisedException()
 #include "pycore_pylifecycle.h"   // _PyErr_Print()
 #include "pycore_pystats.h"       // _Py_PrintSpecializationStats()
+#include "pycore_restricted.h"    // _PyRestricted_Tick()
 #include "pycore_runtime.h"       // _PyRuntime
 
 
@@ -1429,6 +1430,13 @@ _Py_HandlePending(PyThreadState *tstate)
 #if defined(Py_REMOTE_DEBUG) && defined(Py_SUPPORTS_REMOTE_DEBUG)
     _PyRunRemoteDebugger(tstate);
 #endif
+
+    /* window.ml restricted mode: one step of the budget, and the depth. */
+    if ((breaker & _PY_EVAL_RESTRICTED_BIT) != 0) {
+        if (_PyRestricted_Tick(tstate) != 0) {
+            return -1;
+        }
+    }
 
     return 0;
 }

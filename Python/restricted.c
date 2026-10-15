@@ -30,6 +30,7 @@ static PyObject *modules;         // dict: str -> frozenset[str]
 static PyObject *calls;           // dict: callable (or a method's function) -> entry checker or None; called LIFTED
 static PyObject *dynamic;         // dict: type -> predicate(obj, name): a name outside the table the kind admits
 static PyObject *calls_unlifted;  // set of callables called WITHOUT lifting (pure probes such as _restricted.active)
+static PyObject *costs;           // dict: unlifted callable -> cost checker, run before the call (range's length cap)
 static PyObject *not_in_dialect;  // the exception type, registered by _restricted
 
 static int
@@ -44,10 +45,19 @@ is_dunder(PyObject *name)
         && PyUnicode_READ_CHAR(name, n - 1) == '_' && PyUnicode_READ_CHAR(name, n - 2) == '_';
 }
 
+/* Every refusal TRIPS the run: library code that catches it (pandas has `except Exception` fallbacks) cannot turn it
+   into a value, because _restricted.run() refuses a tripped run however it ended. */
+static void
+trip(void)
+{
+    ((_PyThreadStateImpl *)_PyThreadState_GET())->restricted_tripped = 1;
+}
+
 static int
 refuse(const char *what, PyObject *obj, PyObject *name)
 {
     PyObject *exc = not_in_dialect ? not_in_dialect : PyExc_PermissionError;
+    trip();
     if (name != NULL) {
         PyErr_Format(exc, "not in dialect: %s %R of %.100s", what, name, Py_TYPE(obj)->tp_name);
     }
@@ -255,11 +265,14 @@ _PyRestricted_IsLiftedLeaf(PyObject *callable)
    leaf. It refuses by raising (NotInDialect). The manifest's closed vocabulary and the own-functions-only callback rule
    live there. Returns 0 to proceed, -1 refused. */
 static int
-run_checker(PyThreadState *tstate, PyObject *callable, PyObject *args_tuple, PyObject *kwargs)
+run_checker(PyThreadState *tstate, PyObject *table, PyObject *callable, PyObject *args_tuple, PyObject *kwargs)
 {
     PyObject *key = PyMethod_Check(callable) ? PyMethod_GET_FUNCTION(callable) : callable;
     PyObject *checker;
-    int r = PyDict_GetItemRef(calls, key, &checker);
+    if (table == NULL) {
+        return 0;
+    }
+    int r = PyDict_GetItemRef(table, key, &checker);
     if (r <= 0) {
         return r;
     }
@@ -273,10 +286,55 @@ run_checker(PyThreadState *tstate, PyObject *callable, PyObject *args_tuple, PyO
     _PyRestricted_Restore(tstate, saved);
     Py_DECREF(checker);
     if (res == NULL) {
+        trip();
         return -1;
     }
     Py_DECREF(res);
     return 0;
+}
+
+/* Build the tuple and dict a checker sees from a vectorcall's arguments, and run the checker from `table`. */
+static int
+run_checker_vector(PyThreadState *tstate, PyObject *table, PyObject *callable, PyObject *const *args, size_t nargsf,
+                   PyObject *kwnames)
+{
+    Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
+    PyObject *t = _PyTuple_FromArray(args, nargs);
+    PyObject *kw = NULL;
+    if (t == NULL) {
+        return -1;
+    }
+    if (kwnames != NULL && PyTuple_GET_SIZE(kwnames) > 0) {
+        kw = PyDict_New();
+        for (Py_ssize_t i = 0; kw != NULL && i < PyTuple_GET_SIZE(kwnames); i++) {
+            if (PyDict_SetItem(kw, PyTuple_GET_ITEM(kwnames, i), args[nargs + i]) < 0) {
+                Py_CLEAR(kw);
+            }
+        }
+        if (kw == NULL) {
+            Py_DECREF(t);
+            return -1;
+        }
+    }
+    int c = run_checker(tstate, table, callable, t, kw);
+    Py_DECREF(t);
+    Py_XDECREF(kw);
+    return c;
+}
+
+/* An unlifted callable with a cost checker (a C loop the budget cannot see, bounded by its arguments before it runs). */
+static int
+has_cost(PyObject *callable)
+{
+    if (costs == NULL) {
+        return 0;
+    }
+    int r = PyDict_Contains(costs, callable);
+    if (r < 0) {
+        PyErr_Clear();
+        return 1;       /* fail toward running the check, which then reports the error */
+    }
+    return r;
 }
 
 /* Call `callable` from restricted code: gated, and lifted when it is a listed C callable. */
@@ -292,34 +350,14 @@ _PyRestricted_Vectorcall(PyThreadState *tstate, PyObject *callable, PyObject *co
         return NULL;
     }
     if (lift == 0) {
+        if (has_cost(callable) && run_checker_vector(tstate, costs, callable, args, nargsf, kwnames) < 0) {
+            return NULL;
+        }
         return PyObject_Vectorcall(callable, args, nargsf, kwnames);
     }
-    {
-        /* The checker sees the arguments as a tuple and a dict. */
-        Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
-        PyObject *t = _PyTuple_FromArray(args, nargs);
-        PyObject *kw = NULL;
-        if (t == NULL) {
-            return NULL;
-        }
-        if (kwnames != NULL && PyTuple_GET_SIZE(kwnames) > 0) {
-            kw = PyDict_New();
-            for (Py_ssize_t i = 0; kw != NULL && i < PyTuple_GET_SIZE(kwnames); i++) {
-                if (PyDict_SetItem(kw, PyTuple_GET_ITEM(kwnames, i), args[nargs + i]) < 0) {
-                    Py_CLEAR(kw);
-                }
-            }
-            if (kw == NULL) {
-                Py_DECREF(t);
-                return NULL;
-            }
-        }
-        int c = run_checker(tstate, callable, t, kw);
-        Py_DECREF(t);
-        Py_XDECREF(kw);
-        if (c < 0) {
-            return NULL;
-        }
+    /* The checker sees the arguments as a tuple and a dict. */
+    if (run_checker_vector(tstate, calls, callable, args, nargsf, kwnames) < 0) {
+        return NULL;
     }
     _PyRestrictedSaved saved = _PyRestricted_Lift(tstate);
     PyObject *res = PyObject_Vectorcall(callable, args, nargsf, kwnames);
@@ -339,9 +377,12 @@ _PyRestricted_Call(PyThreadState *tstate, PyObject *callable, PyObject *args, Py
         return NULL;
     }
     if (lift == 0) {
+        if (has_cost(callable) && run_checker(tstate, costs, callable, args, kwargs) < 0) {
+            return NULL;
+        }
         return PyObject_Call(callable, args, kwargs);
     }
-    if (run_checker(tstate, callable, args, kwargs) < 0) {
+    if (run_checker(tstate, calls, callable, args, kwargs) < 0) {
         return NULL;
     }
     _PyRestrictedSaved saved = _PyRestricted_Lift(tstate);
@@ -410,6 +451,11 @@ _PyRestricted_AllowCall(PyObject *callable, int lift, PyObject *checker)
         if (ensure(&calls_unlifted, new_set) < 0) {
             return -1;
         }
+        if (checker != NULL && checker != Py_None) {
+            if (ensure(&costs, new_dict) < 0 || PyDict_SetItem(costs, callable, checker) < 0) {
+                return -1;
+            }
+        }
         return PySet_Add(calls_unlifted, callable);
     }
     if (ensure(&calls, new_dict) < 0) {
@@ -452,5 +498,40 @@ _PyRestricted_Reset(void)
     Py_CLEAR(modules);
     Py_CLEAR(calls);
     Py_CLEAR(calls_unlifted);
+    Py_CLEAR(costs);
     Py_CLEAR(dynamic);
+}
+
+/* --- the step budget and the depth (Python/ceval_gil.c calls this from _Py_HandlePending) --- */
+
+/* One step: charged wherever CPython already checks the eval breaker, which is every backward jump and every call,
+   i.e. where loops and recursion are. Lifted library Python is charged too: the budget measures interpreter work in
+   the run, whoever's code it is. Once exhausted the budget stays exhausted, so every later check refuses again and a
+   library `except Exception` that swallowed one refusal meets the next at its own next loop or call. The DEPTH is
+   judged only at a CO_RESTRICTED frame (a program's own def or lambda), counted in Python frames above where the run
+   began, so a lifted leaf's internals may nest as CPython allows while the program's recursion is bounded. */
+int
+_PyRestricted_Tick(PyThreadState *tstate)
+{
+    _PyThreadStateImpl *ts = (_PyThreadStateImpl *)tstate;
+    PyObject *exc = not_in_dialect ? not_in_dialect : PyExc_PermissionError;
+    if (--ts->restricted_steps < 0) {
+        ts->restricted_steps = -1;      /* stays exhausted, and cannot wrap */
+        trip();
+        PyErr_Format(exc, "not in dialect: the step budget (%lld) ran out", ts->restricted_budget);
+        return -1;
+    }
+    _PyInterpreterFrame *f = tstate->current_frame;
+    if (f != NULL && f->owner != FRAME_OWNED_BY_INTERPRETER) {
+        PyObject *exec = PyStackRef_AsPyObjectBorrow(f->f_executable);
+        if (PyCode_Check(exec) && (((PyCodeObject *)exec)->co_flags & CO_RESTRICTED)) {
+            int depth = ts->restricted_depth_base - tstate->py_recursion_remaining;
+            if (depth > ts->restricted_depth_limit) {
+                trip();
+                PyErr_Format(exc, "not in dialect: recursion past the depth (%d frames)", ts->restricted_depth_limit);
+                return -1;
+            }
+        }
+    }
+    return 0;
 }
