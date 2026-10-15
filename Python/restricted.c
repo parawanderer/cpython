@@ -72,7 +72,7 @@ listed(PyObject *table, PyObject *index, PyObject *key)
     return r;
 }
 
-static PyObject *item_read, *item_write, *call_marker;   // interned "[]", "[]=" and "()"
+static PyObject *item_read, *item_write, *call_marker, *item_lift;   // interned "[]", "[]=", "()" and "[]^"
 
 static int
 check_attr(PyObject *obj, PyObject *name, const char *what)
@@ -115,6 +115,8 @@ _PyRestricted_CheckSetAttr(PyObject *obj, PyObject *name)
     return refuse("setting attribute", obj, name);
 }
 
+/* 0 to proceed unlifted, 1 to proceed LIFTED (the kind lists "[]^": its item protocol is a manifest leaf, e.g. a
+   DataFrame's __getitem__ in pandas Python), -1 refused. */
 int
 _PyRestricted_CheckItem(PyObject *obj, int write)
 {
@@ -122,7 +124,11 @@ _PyRestricted_CheckItem(PyObject *obj, int write)
     if (r < 0) {
         return -1;
     }
-    return r ? 0 : refuse(write ? "item assignment" : "item access", obj, NULL);
+    if (!r) {
+        return refuse(write ? "item assignment" : "item access", obj, NULL);
+    }
+    r = listed(kinds, (PyObject *)Py_TYPE(obj), item_lift);
+    return r < 0 ? -1 : r;
 }
 
 int
@@ -143,6 +149,15 @@ _PyRestricted_CheckImport(PyObject *name)
 int
 _PyRestricted_CheckCall(PyObject *callable)
 {
+    /* A manifest leaf registered lifted: the callable itself, or (a bound method is a fresh object per access) the
+       function under it. Checked first, so a lifted pure-Python leaf (pandas) is lifted rather than run as tier 3. */
+    if (calls != NULL) {
+        PyObject *key = PyMethod_Check(callable) ? PyMethod_GET_FUNCTION(callable) : callable;
+        int r = PySet_Contains(calls, key);
+        if (r != 0) {
+            return r > 0 ? 1 : -1;
+        }
+    }
     if (PyFunction_Check(callable) || PyMethod_Check(callable)) {
         return 0;
     }
@@ -150,12 +165,6 @@ _PyRestricted_CheckCall(PyObject *callable)
         int r = PySet_Contains(calls_unlifted, callable);
         if (r != 0) {
             return r > 0 ? 0 : -1;
-        }
-    }
-    if (calls != NULL) {
-        int r = PySet_Contains(calls, callable);
-        if (r != 0) {
-            return r > 0 ? 1 : -1;
         }
     }
     /* An instance of a kind that lists "()" (operator.attrgetter(...), a numpy ufunc): called unlifted. */
@@ -263,7 +272,8 @@ _PyRestricted_AllowKind(PyObject *type, PyObject *names)
         item_read = PyUnicode_InternFromString("[]");
         item_write = PyUnicode_InternFromString("[]=");
         call_marker = PyUnicode_InternFromString("()");
-        if (item_read == NULL || item_write == NULL || call_marker == NULL) {
+        item_lift = PyUnicode_InternFromString("[]^");
+        if (item_read == NULL || item_write == NULL || call_marker == NULL || item_lift == NULL) {
             return -1;
         }
     }
