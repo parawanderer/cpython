@@ -50,6 +50,14 @@ class BuildTest(unittest.TestCase):
 
 
 class CompileTest(unittest.TestCase):
+    def setUp(self):
+        for f in (sum, max, range):
+            _restricted.allow_call(f, False)
+        _restricted.allow_module("math", [])
+
+    def tearDown(self):
+        _restricted.reset()
+
     def test_every_nested_code_object_is_marked(self):
         code = restricted.compile_cell("def f():\n    return [x for x in (lambda: [1])()]\nreturn f()")
         seen = []
@@ -68,6 +76,25 @@ class CompileTest(unittest.TestCase):
     def test_run_refuses_unmarked_code(self):
         with self.assertRaises(ValueError):
             _restricted.run(compile("1", "<x>", "exec"), {})
+
+    def test_membership_refuses_before_running(self):
+        for src in ("while True:\n    pass", "class A:\n    pass", "global x\nx = 1", "with x:\n    pass",
+                    "g = (x for x in [1])", "return (x for x in [1])", "return max((x for x in [1]), 5)",
+                    "return __builtins__", "return (1).__class__", "def __init__():\n    pass", "yield 1"):
+            with self.assertRaises(restricted.NotInDialect, msg=src):
+                restricted.compile_cell(src)
+
+    def test_a_consumer_genexp_is_rewritten_to_a_list_comprehension(self):
+        code = restricted.compile_cell("return sum(x * x for x in range(4))")
+        inner = [c for c in code.co_consts if isinstance(c, type(code))][0]
+        self.assertNotIn("<genexpr>", [k.co_name for k in inner.co_consts if isinstance(k, type(code))])
+        self.assertEqual(restricted.run_cell("return sum(x * x for x in range(4))", {}), 14)
+        self.assertEqual(restricted.run_cell("return max((x for x in [3, 1]), default=0)", {}), 3)
+
+    def test_top_level_names_persist_in_the_namespace(self):
+        ns = {}
+        restricted.run_cell("import math\nxs = [1]\nfor i in [2]:\n    pass\ndef f():\n    return 1", ns)
+        self.assertEqual(sorted(k for k in ns if not k.startswith("_")), ["f", "i", "math", "xs"])
 
     def test_a_top_level_return_is_the_value(self):
         self.assertEqual(restricted.run_cell("return 6 * 7", {}), 42)
@@ -133,7 +160,7 @@ class ExtentTest(unittest.TestCase):
     def test_a_restricted_def_called_from_outside_any_entry_runs_unrestricted(self):
         # Ruled 2026-10-15: restriction is a property of the ENTRY; the bare caller already holds full capability.
         ns = self.ns()
-        restricted.run_cell("global probe\ndef probe():\n    return active()\nreturn probe()", ns)
+        restricted.run_cell("def probe():\n    return active()\nreturn probe()", ns)
         self.assertFalse(ns["probe"]())
 
     def test_runs_nest(self):

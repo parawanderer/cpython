@@ -3,11 +3,17 @@
 A cell is compiled the way window.ml's python_exec runs it: as the body of a function, so a top-level ``return`` is
 legal and is the cell's value. Every code object in the result, the cell's own and each nested ``def``, ``lambda`` and
 comprehension, carries ``CO_RESTRICTED``, so a callback the cell hands to a C leaf is recognised as restricted when the
-leaf calls it back. Membership (the AST whitelist) is checked before compiling, in a later slice.
+leaf calls it back. Membership is checked BEFORE compiling: every node must be in the whitelist (window-ml's
+notebooks/python-dialect/data/whitelist.json, the one ratchet), a generator expression is admitted only as the sole
+positional argument of a listed consumer and is rewritten to a list comprehension there, and a dunder name or
+attribute is refused outright. A refusal here is NotInDialect before anything runs.
 """
 
+import ast
 import textwrap
 import _restricted
+
+NotInDialect = _restricted.NotInDialect
 
 __all__ = ["compile_cell", "run_cell", "mark", "load_manifests", "CO_RESTRICTED"]
 
@@ -20,16 +26,101 @@ def mark(code):
     return code.replace(co_flags=code.co_flags | CO_RESTRICTED, co_consts=consts)
 
 
-def compile_cell(source, filename="<cell>"):
-    """Compile a cell's source as the body of ``_user()`` and return a module code object that defines and calls it,
-    leaving the return value in the global ``__cell_result__``. Every code object in it is marked restricted."""
-    wrapped = "def _user():\n" + textwrap.indent(source, "    ") + "\n__cell_result__ = _user()\n"
-    return mark(compile(wrapped, filename, "exec", dont_inherit=True))
+# The node whitelist when none is given: window-ml's ruled set (whitelist.json "nodes", 2026-10-15). A runner passes the
+# file's list explicitly; this copy only keeps the module usable on its own.
+DEFAULT_NODES = frozenset("""Add And AnnAssign Assert Assign Attribute AugAssign BinOp BitAnd BitOr BitXor BoolOp Break Call
+    Compare Constant Continue Del Delete Dict DictComp Div Eq Expr FloorDiv For FormattedValue FunctionDef Gt GtE If
+    IfExp Import ImportFrom In Invert Is IsNot JoinedStr LShift Lambda List ListComp Load Lt LtE MatMult Mod Mult Name
+    Not NotEq NotIn Or Pass Pow RShift Raise Return Set SetComp Slice Starred Store Sub Subscript Tuple UAdd USub
+    UnaryOp alias arg arguments comprehension keyword""".split())
+CONSUMERS = frozenset({"sum", "any", "all", "min", "max", "sorted", "list", "tuple", "set", "dict", "enumerate", "zip"})
 
 
-def run_cell(source, namespace):
-    """Compile and run a cell in ``namespace`` (a dict) with the thread restricted; return the cell's value."""
-    _restricted.run(compile_cell(source), namespace)
+def _dunder(name):
+    return len(name) >= 4 and name.startswith("__") and name.endswith("__")
+
+
+class _Membership(ast.NodeTransformer):
+    """Refuses a node outside the whitelist and a dunder; rewrites a consumer-position genexp to a list comprehension.
+    Runs over the CELL's own tree, before the wrapper exists."""
+
+    def __init__(self, nodes):
+        self.nodes = nodes
+
+    def refuse(self, node, why):
+        raise NotInDialect(f"not in dialect: {why} (line {getattr(node, 'lineno', '?')})")
+
+    def visit_Call(self, node):
+        f = node.func
+        consumer = (isinstance(f, ast.Name) and f.id in CONSUMERS) or (isinstance(f, ast.Attribute) and f.attr == "join")
+        if consumer and len(node.args) == 1 and isinstance(node.args[0], ast.GeneratorExp):
+            g = node.args[0]
+            node.args[0] = ast.copy_location(ast.ListComp(elt=g.elt, generators=g.generators), g)
+        return self.generic_visit(node)
+
+    def generic_visit(self, node):
+        kind = type(node).__name__
+        if kind == "GeneratorExp":
+            self.refuse(node, "a generator expression outside consumer position")
+        if kind not in self.nodes:
+            self.refuse(node, f"{kind}")
+        if isinstance(node, ast.Name) and _dunder(node.id):
+            self.refuse(node, f"the name {node.id}")
+        if isinstance(node, ast.Attribute) and _dunder(node.attr):
+            self.refuse(node, f"the attribute {node.attr}")
+        if isinstance(node, (ast.FunctionDef, ast.arg, ast.alias)):
+            name = getattr(node, "name", None) or getattr(node, "arg", None) or getattr(node, "asname", None)
+            if name and _dunder(name):
+                self.refuse(node, f"the name {name}")
+        return super().generic_visit(node)
+
+
+def check(source, nodes=DEFAULT_NODES):
+    """The cell's statements, membership-checked and rewritten, as an ``ast`` list for the wrapper's body. Raises
+    NotInDialect (or SyntaxError) before anything runs."""
+    body = "def _user():\n" + textwrap.indent(source, "    ")
+    tree = ast.parse(body)
+    stmts = tree.body[0].body
+    m = _Membership(frozenset(nodes))
+    return [m.visit(s) for s in stmts]
+
+
+def compile_cell(source, filename="<cell>", nodes=DEFAULT_NODES):
+    """Check a cell's membership, then compile it as the body of ``_user()`` (a top-level ``return`` is its value) in
+    a module that calls it and leaves the value in ``__cell_result__``. Names the cell binds at its top level are
+    declared ``global`` by the WRAPPER, as window.ml's runtime does, so they persist in the namespace; the cell itself
+    may not say ``global``. Every code object is marked restricted."""
+    stmts = check(source, nodes)
+    top = sorted({t.id for s in stmts for t in _top_targets(s)})
+    fn = ast.FunctionDef(name="_user", args=ast.arguments(), body=([ast.Global(names=top)] if top else []) + stmts,
+                         decorator_list=[], returns=None, type_params=[])
+    call = ast.Assign(targets=[ast.Name("__cell_result__", ast.Store())], value=ast.Call(ast.Name("_user", ast.Load()), [], []))
+    mod = ast.fix_missing_locations(ast.Module(body=[fn, call], type_ignores=[]))
+    return mark(compile(mod, filename, "exec", dont_inherit=True))
+
+
+def _top_targets(stmt):
+    """The names a top-level statement binds: assignment targets, a def's name, an import's binding, a for target."""
+    if isinstance(stmt, ast.FunctionDef):
+        return [ast.Name(stmt.name)]
+    if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+        return [ast.Name(a.asname or a.name.split(".")[0]) for a in stmt.names]
+    targets = []
+    if isinstance(stmt, ast.Assign):
+        targets = stmt.targets
+    elif isinstance(stmt, (ast.AugAssign, ast.AnnAssign, ast.For)):
+        targets = [stmt.target]
+    out = []
+    for t in targets:
+        for n in ast.walk(t):
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                out.append(n)
+    return out
+
+
+def run_cell(source, namespace, nodes=DEFAULT_NODES):
+    """Check, compile and run a cell in ``namespace`` (a dict) with the thread restricted; return the cell's value."""
+    _restricted.run(compile_cell(source, nodes=nodes), namespace)
     return namespace.pop("__cell_result__", None)
 
 
