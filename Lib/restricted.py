@@ -187,9 +187,11 @@ def entry_check(name, method, arguments=True):
         if method:
             if self is None:
                 self, args = (args[0] if args else None), args[1:]
-            if (writes_self or (kwargs or {}).get("inplace")) and not _restricted.owned(self):
-                raise NotInDialect(f"not in dialect: {name}() writes a value the cell does not own "
-                                   f"({type(self).__name__})")
+            if writes_self or (kwargs or {}).get("inplace"):
+                if not _restricted.owned(self):
+                    raise NotInDialect(f"not in dialect: {name}() writes a value the cell does not own "
+                                       f"({type(self).__name__})")
+                _restricted.write_barrier(self)     # logged before the leaf writes it, for a refusal to undo
         if not arguments:
             return
         given = list(args) + list((kwargs or {}).values())
@@ -417,7 +419,40 @@ def load_manifests(data_dir):
                 _restricted.allow_dynamic(cls, lambda obj, name, _cls=cls: isinstance(name, str)
                                           and not hasattr(_cls, name) and name in obj.columns)
             done["kinds"][f"{mod_name}.{kind}"] = listed + extra
+    _register_snapshots()
     return done
+
+
+def _snapshot_frame(obj):
+    return obj.copy(deep=True)
+
+
+def _restore_frame(obj, state):
+    obj._update_inplace(state)      # pandas' own in-place replacement: data, index and columns
+
+
+def _snapshot_array(obj):
+    return obj.copy()
+
+
+def _restore_array(obj, state):
+    import numpy
+    numpy.copyto(obj, state)        # same shape and dtype: a write never resizes an ndarray
+
+
+def _register_snapshots():
+    """The undo log's copy and restore for owned values of library kinds (a copy an earlier cell made)."""
+    try:
+        import numpy
+        _restricted.allow_snapshot(numpy.ndarray, _snapshot_array, _restore_array)
+    except ImportError:
+        pass
+    try:
+        import pandas
+        for cls in (pandas.DataFrame, pandas.Series):
+            _restricted.allow_snapshot(cls, _snapshot_frame, _restore_frame)
+    except ImportError:
+        pass
 
 
 def _kind_class(mod_name, kind):

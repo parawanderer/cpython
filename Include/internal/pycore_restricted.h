@@ -112,6 +112,12 @@ PyAPI_FUNC(int) _PyRestricted_OwnedReady(void);
 PyAPI_FUNC(int) _PyRestricted_MemoryBegin(long long limit);
 PyAPI_FUNC(int) _PyRestricted_MemoryEnd(long long *peak);
 
+/* Rollback (slice 6): the undo log at the write barrier. */
+PyAPI_FUNC(int) _PyRestricted_WriteBarrier(PyObject *obj);
+PyAPI_FUNC(int) _PyRestricted_UndoBegin(void);
+PyAPI_FUNC(int) _PyRestricted_UndoEnd(int refused);
+PyAPI_FUNC(int) _PyRestricted_AllowSnapshot(PyObject *type, PyObject *snapshot, PyObject *restore);
+
 /* Registration, host-only (Modules/_restrictedmodule.c). */
 PyAPI_FUNC(int) _PyRestricted_AllowKind(PyObject *type, PyObject *names);
 PyAPI_FUNC(int) _PyRestricted_AllowModule(PyObject *name, PyObject *names);
