@@ -117,7 +117,14 @@ restricted_run(PyObject *module, PyObject *const *args, Py_ssize_t nargs)
     ts->restricted_tripped = 0;
     _Py_set_eval_breaker_bit(tstate, _PY_EVAL_RESTRICTED_BIT);
     int counting = _PyRestricted_MemoryBegin(memory);
-    PyObject *result = counting < 0 ? NULL : PyEval_EvalCode(code, globals, globals);
+    int logging = counting < 0 ? -1 : _PyRestricted_UndoBegin();
+    /* The namespace itself: a cell's top-level names are globals (STORE_GLOBAL writes the dict directly, past the
+       gate), so a refused run puts the bindings back as they were, new names removed. Only the outermost run. */
+    PyObject *names_before = logging > 0 ? PyDict_Copy(globals) : NULL;
+    if (logging > 0 && names_before == NULL) {
+        logging = -1;
+    }
+    PyObject *result = logging < 0 ? NULL : PyEval_EvalCode(code, globals, globals);
 
     if (!was_metered) {
         _Py_unset_eval_breaker_bit(tstate, _PY_EVAL_RESTRICTED_BIT);
@@ -158,6 +165,30 @@ restricted_run(PyObject *module, PyObject *const *args, Py_ssize_t nargs)
     ts->restricted = saved.restricted;
     ts->restricted_lifted = saved.lifted;
     ts->restricted_barrier = saved.barrier;
+    if (logging >= 0) {
+        /* A REFUSED run (NotInDialect, however it arose: the gate, the budget, the depth, the memory cap) replays the
+           undo log, so the namespace and every value it reaches are as before the cell. An ordinary error (a
+           ZeroDivisionError in the cell's own logic) keeps its writes, as python_exec does today. */
+        int refused = result == NULL && PyErr_ExceptionMatches(not_in_dialect);
+        int replay = _PyRestricted_UndoEnd(refused);
+        if (refused && names_before != NULL) {
+            PyObject *exc = PyErr_GetRaisedException();
+            PyDict_Clear(globals);
+            if (PyDict_Update(globals, names_before) < 0) {
+                PyErr_Clear();
+                replay = -1;
+            }
+            PyErr_SetRaisedException(exc);
+        }
+        if (replay < 0 && refused) {
+            PyObject *exc = PyErr_GetRaisedException();
+            PyErr_SetString(PyExc_SystemError, "restricted: a refused run's undo log did not replay cleanly");
+            PyObject *now = PyErr_GetRaisedException();
+            PyException_SetContext(now, exc);
+            PyErr_SetRaisedException(now);
+        }
+    }
+    Py_XDECREF(names_before);
     ts->restricted_steps = saved_steps;
     ts->restricted_budget = saved_budget;
     ts->restricted_depth_base = saved_base;
@@ -186,6 +217,31 @@ static PyObject *
 restricted_allow_fresh(PyObject *module, PyObject *callable)
 {
     if (_PyRestricted_AllowFresh(callable) < 0) {
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
+/* allow_snapshot(type, snapshot, restore): how the undo log copies and restores an owned value of a kind CPython
+   cannot copy itself (a pandas frame, a numpy array). snapshot(obj) -> state; restore(obj, state) in place. */
+static PyObject *
+restricted_allow_snapshot(PyObject *module, PyObject *const *args, Py_ssize_t nargs)
+{
+    if (nargs != 3 || !PyType_Check(args[0])) {
+        PyErr_SetString(PyExc_TypeError, "allow_snapshot(type, snapshot, restore)");
+        return NULL;
+    }
+    if (_PyRestricted_AllowSnapshot(args[0], args[1], args[2]) < 0) {
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
+/* write_barrier(obj): log obj's contents before a lifted leaf writes it (an entry checker calls this). */
+static PyObject *
+restricted_write_barrier(PyObject *module, PyObject *obj)
+{
+    if (_PyRestricted_WriteBarrier(obj) < 0) {
         return NULL;
     }
     Py_RETURN_NONE;
@@ -354,6 +410,10 @@ static PyMethodDef restricted_methods[] = {
      "allow_mutators(type, names, /)\n--\n\nThese methods write their receiver: read only off an owned value."},
     {"allow_fresh", restricted_allow_fresh, METH_O,
      "allow_fresh(callable, /)\n--\n\nA lifted leaf whose result is a new value, owned by the cell."},
+    {"allow_snapshot", _PyCFunction_CAST(restricted_allow_snapshot), METH_FASTCALL,
+     "allow_snapshot(type, snapshot, restore, /)\n--\n\nHow the undo log copies and restores an owned value of this kind."},
+    {"write_barrier", restricted_write_barrier, METH_O,
+     "write_barrier(obj, /)\n--\n\nLog obj's contents before a lifted leaf writes it."},
     {"owned", restricted_owned, METH_O,
      "owned(obj, /)\n--\n\nWhether obj is the cell's own."},
     {"memory", restricted_memory, METH_NOARGS,

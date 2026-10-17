@@ -710,6 +710,117 @@ class LiftedDunderTest(unittest.TestCase):
             self.run_cell('return f + "{0.__class__}".format', f=Frame(1))
 
 
+class UndoTest(unittest.TestCase):
+    """Slice 6: a REFUSED run (the gate, the budget, the depth, the memory cap, or a refusal library code caught)
+    leaves the namespace and every value it reaches as before the cell: bindings, and the contents of every value
+    the cell wrote that existed before it. An ordinary error keeps its writes, as python_exec does today."""
+
+    def setUp(self):
+        for f in (len, list, range, sorted, dict, set, bytearray):
+            _restricted.allow_call(f, False, restricted._range_cost if f is range else None)
+        _restricted.allow_kind(list, ["append", "extend", "sort", "pop", "[]", "[]="])
+        _restricted.allow_kind(dict, ["update", "pop", "[]", "[]="])
+        _restricted.allow_kind(set, ["add"])
+        _restricted.allow_kind(bytearray, ["append", "[]", "[]="])
+        for t, names in restricted.MUTATORS.items():
+            _restricted.allow_mutators(t, names)
+        _restricted.allow_call(swallow, True)
+        _restricted.allow_call(each, True)
+
+    def tearDown(self):
+        _restricted.reset()
+
+    def cell(self, ns, src, **kw):
+        ns.setdefault("swallow", swallow)
+        ns.setdefault("each", each)
+        return restricted.run_cell(src, ns, **kw)
+
+    def world(self):
+        ns = {}
+        self.cell(ns, "xs = [3, 1, 2]\nd = {'a': 1}\ns = {1}\nb = bytearray(2)\nnested = [[1], {'k': [2]}]\nn = 1")
+        return ns
+
+    def snapshot(self, ns):
+        return repr(sorted((k, v) for k, v in ns.items() if not callable(v)))
+
+    REFUSALS = {
+        "the gate": "().__class__",
+        "the budget": "for i in range(1000):\n    pass",
+        "the depth": "def f(n):\n    return f(n + 1)\nf(0)",
+        "the memory cap": '"a" * 10 ** 11',
+        "a caught refusal": "swallow(lambda: ().__class__)",
+    }
+
+    WRITES = ("xs.append(9)\nxs[0] = 7\nxs.sort()\nxs += [5]\n"
+              "d['b'] = 2\nd.update({'a': 0})\ndel d['a']\n"
+              "s.add(5)\ns |= {6}\nb[0] = 1\nb.append(3)\n"
+              "nested[0].append(8)\nnested[1]['k'].append(9)\nnested[1]['z'] = 1\n"
+              "n = 99\nnew_name = 1\ndel n\n")
+
+    def test_every_write_before_every_kind_of_refusal_is_undone(self):
+        for why, refusal in self.REFUSALS.items():
+            ns = self.world()
+            before = self.snapshot(ns)
+            with self.assertRaises(_restricted.NotInDialect, msg=why):
+                self.cell(ns, self.WRITES + refusal, budget=200 if why == "the budget" else None)
+            self.assertEqual(self.snapshot(ns), before, why)
+
+    def test_writes_inside_a_callback_from_a_lifted_leaf_are_undone(self):
+        ns = self.world()
+        before = self.snapshot(ns)
+        with self.assertRaises(_restricted.NotInDialect):
+            self.cell(ns, "each(lambda i: xs.append(i), 5)\n().__class__")
+        self.assertEqual(self.snapshot(ns), before)
+
+    def test_the_same_value_written_many_times_is_logged_once(self):
+        ns = self.world()
+        with self.assertRaises(_restricted.NotInDialect):
+            self.cell(ns, "for i in range(10000):\n    xs.append(i)\n().__class__")
+        self.assertEqual(ns["xs"], [3, 1, 2])
+
+    def test_a_value_aliased_by_two_names(self):
+        ns = self.world()
+        self.cell(ns, "ys = xs")
+        with self.assertRaises(_restricted.NotInDialect):
+            self.cell(ns, "ys.append(1)\nxs.append(2)\n().__class__")
+        self.assertIs(ns["xs"], ns["ys"])
+        self.assertEqual(ns["xs"], [3, 1, 2])
+
+    def test_identity_is_kept(self):
+        ns = self.world()
+        xs = ns["xs"]
+        with self.assertRaises(_restricted.NotInDialect):
+            self.cell(ns, "xs.append(1)\nxs = [0]\n().__class__")
+        self.assertIs(ns["xs"], xs, "the binding is restored to the same object, not a copy")
+
+    def test_a_successful_run_keeps_its_writes(self):
+        ns = self.world()
+        self.cell(ns, "xs.append(9)\nd['b'] = 2")
+        self.assertEqual((ns["xs"], ns["d"]), ([3, 1, 2, 9], {"a": 1, "b": 2}))
+
+    def test_an_ordinary_error_keeps_its_writes(self):
+        ns = self.world()
+        with self.assertRaises(ZeroDivisionError):
+            self.cell(ns, "xs.append(9)\n1 // 0")
+        self.assertEqual(ns["xs"], [3, 1, 2, 9])
+
+    def test_the_log_does_not_leak_into_the_next_run(self):
+        ns = self.world()
+        with self.assertRaises(_restricted.NotInDialect):
+            self.cell(ns, "xs.append(1)\n().__class__")
+        self.cell(ns, "xs.append(2)")
+        self.assertEqual(ns["xs"], [3, 1, 2, 2])
+        with self.assertRaises(_restricted.NotInDialect):
+            self.cell(ns, "xs.append(3)\n().__class__")
+        self.assertEqual(ns["xs"], [3, 1, 2, 2], "a refusal undoes back to the last successful cell, no further")
+
+    def test_values_this_cell_made_are_simply_dropped(self):
+        ns = self.world()
+        with self.assertRaises(_restricted.NotInDialect):
+            self.cell(ns, "zs = []\nzs.append(1)\n().__class__")
+        self.assertNotIn("zs", ns)
+
+
 try:
     import warnings
     with warnings.catch_warnings():     # numpy adds filters at import; keep the test environment as it was
@@ -772,6 +883,16 @@ class StockWheelsTest(unittest.TestCase):
         df = self.df()
         self.assertEqual(self.run_cell("d = df.copy()\nd['c'] = 1\nd += 1\nreturn int(d['c'].sum())", df=df), 6)
         self.assertEqual(list(df.columns), ["a", "b"])
+
+    def test_an_owned_frame_from_an_earlier_cell_is_restored(self):
+        _restricted.allow_snapshot(pandas.DataFrame, restricted._snapshot_frame, restricted._restore_frame)
+        _restricted.allow_snapshot(pandas.Series, restricted._snapshot_frame, restricted._restore_frame)
+        ns = {"df": self.df()}
+        restricted.run_cell("d = df.copy()", ns)
+        with self.assertRaises(_restricted.NotInDialect):
+            restricted.run_cell("d['c'] = 1\nd['a'] = 0\nd += 1\n().__class__", ns)
+        self.assertEqual(list(ns["d"].columns), ["a", "b"])
+        self.assertEqual(ns["d"]["a"].tolist(), [1, 2, 3])
 
     def test_a_callable_key(self):
         df = self.df()

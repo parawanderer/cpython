@@ -25,6 +25,7 @@
 #include "pycore_tstate.h"        // _PyThreadStateImpl
 #include "pycore_tuple.h"         // _PyTuple_FromArray()
 #include "pycore_hashtable.h"     // _Py_hashtable_t: the owned set
+#include "pycore_setobject.h"     // _PySet_Update()
 
 static PyObject *kinds;           // dict: type -> frozenset[str]
 static PyObject *modules;         // dict: str -> frozenset[str]
@@ -35,8 +36,10 @@ static PyObject *costs;           // dict: unlifted callable -> cost checker, ru
 static PyObject *not_in_dialect;  // the exception type, registered by _restricted
 static PyObject *mutators;        // dict: type -> frozenset of method names that write their receiver
 static PyObject *fresh;           // set: lifted callables (or a method's function) whose result is a new value
+static PyObject *snapshots;       // dict: type -> (snapshot, restore): the undo log for kinds CPython cannot copy
 
 static int is_owned(PyObject *obj);
+int _PyRestricted_WriteBarrier(PyObject *obj);
 int _PyRestricted_MemoryTripped(void);
 static void mark_fresh(PyObject *callable, PyObject *result, PyObject *const *args, Py_ssize_t nargs, PyObject *self);
 
@@ -155,6 +158,9 @@ check_attr(PyObject *obj, PyObject *name, const char *what)
         if (m && !is_owned(obj)) {
             return refuse("a method that writes a value the cell does not own:", obj, name);
         }
+        if (m && _PyRestricted_WriteBarrier(obj) < 0) {
+            return -1;
+        }
     }
     return r ? 0 : refuse(what, obj, name);
 }
@@ -189,6 +195,9 @@ _PyRestricted_CheckItem(PyObject *obj, int write)
     }
     if (write && !is_owned(obj)) {
         return refuse("item assignment to a value the cell does not own:", obj, NULL);
+    }
+    if (write && _PyRestricted_WriteBarrier(obj) < 0) {
+        return -1;
     }
     r = listed(kinds, (PyObject *)Py_TYPE(obj), item_lift);
     return r < 0 ? -1 : r;
@@ -535,6 +544,7 @@ _PyRestricted_Reset(void)
     Py_CLEAR(costs);
     Py_CLEAR(mutators);
     Py_CLEAR(fresh);
+    Py_CLEAR(snapshots);
     Py_CLEAR(dynamic);
 }
 
@@ -590,7 +600,8 @@ _PyRestricted_Tick(PyThreadState *tstate)
    reused is never owned by accident. If another tracer replaces ours, every ownership is FORGOTTEN at the next run
    (owned_reset): unowned is the safe direction. */
 
-static _Py_hashtable_t *owned;
+static _Py_hashtable_t *owned;      /* value: the run epoch the object became owned in */
+static uintptr_t owned_epoch = 1;   /* the current outermost run's epoch (never 0, which reads as "absent") */
 #define MAX_TRACKED 32
 static PyTypeObject *tracked[MAX_TRACKED];      /* types whose instances may be in the set */
 static int ntracked;
@@ -646,7 +657,7 @@ ref_tracer(PyObject *op, PyRefTracerEvent event, void *data)
         if (owned_on_create(tp)) {
             PyThreadState *tstate = _PyThreadState_GET();
             if (tstate != NULL && _PyRestricted_Active(tstate)) {
-                (void)_Py_hashtable_set(owned, op, op);     /* on failure the value is simply not owned */
+                (void)_Py_hashtable_set(owned, op, (void *)owned_epoch);  /* on failure: simply not owned */
             }
         }
         else if (is_generator_type(tp)) {
@@ -743,7 +754,7 @@ mark_fresh(PyObject *callable, PyObject *result, PyObject *const *args, Py_ssize
         }
     }
     if (track(Py_TYPE(result)) == 0) {
-        (void)_Py_hashtable_set(owned, result, result);
+        (void)_Py_hashtable_set(owned, result, (void *)owned_epoch);
     }
 }
 
@@ -752,7 +763,7 @@ int
 _PyRestricted_CheckInPlace(PyObject *v)
 {
     if (is_owned(v)) {
-        return 0;
+        return _PyRestricted_WriteBarrier(v);
     }
     return refuse("an in-place operator on a value the cell does not own:", v, NULL);
 }
@@ -1074,5 +1085,173 @@ _PyRestricted_LiftsDunders(PyObject *self)
         PyErr_Clear();
         return 0;       /* fail toward gated */
     }
+    return r;
+}
+
+
+/* --- rollback: the undo log at the write barrier (slice 6) ---
+
+   The first write a run makes to an owned value that is OLDER than the run (an earlier cell's list, a copy an earlier
+   cell made) records a snapshot of that value's whole contents; a value the run itself made needs none, since nothing
+   outside the run can see it. A refused run replays every snapshot, so the namespace and every value it reaches are
+   as they were before the cell. Whole-object snapshots, once per value per run, rather than one entry per write: a C
+   method that rewrites a container in one call (list.sort, dict.update) is covered the same way as an item write.
+   Values the barrier admits but CPython cannot copy (a pandas frame, a numpy array) use a SNAPSHOT pair the host
+   registers per type (allow_snapshot); a write to an owned value of a kind with neither is refused.
+
+   The barrier sits where ownership is checked: an item write or delete, an in-place operator, reading a mutating
+   method, and a lifted leaf's write check (_restricted.write_barrier from the entry checker). */
+
+static PyObject *undo;              /* list of (obj, state, restore-or-None), in write order */
+static _Py_hashtable_t *undo_seen;  /* obj -> 1: already snapshotted in this run */
+static int undo_depth;              /* nesting of run(): only the outermost run owns the log */
+
+static uintptr_t
+owned_since(PyObject *obj)
+{
+    return owned == NULL ? 0 : (uintptr_t)_Py_hashtable_get(owned, obj);
+}
+
+int
+_PyRestricted_WriteBarrier(PyObject *obj)
+{
+    if (undo == NULL || undo_depth == 0) {
+        return 0;                   /* no run: nothing to roll back to */
+    }
+    if (owned_since(obj) == owned_epoch || _Py_hashtable_get(undo_seen, obj) != NULL) {
+        return 0;
+    }
+    PyThreadState *tstate = _PyThreadState_GET();
+    _PyThreadStateImpl *ts = (_PyThreadStateImpl *)tstate;
+    /* Copy with the gate fully off: the copy is host bookkeeping, never the cell's value. */
+    _PyRestrictedSaved saved = {ts->restricted, ts->restricted_lifted, ts->restricted_barrier};
+    ts->restricted = 0;
+    ts->restricted_lifted = 0;
+    PyObject *state = NULL, *restore = Py_None;
+    PyTypeObject *tp = Py_TYPE(obj);
+    PyObject *pair = NULL;
+    if (tp == &PyList_Type) {
+        state = PyList_GetSlice(obj, 0, PY_SSIZE_T_MAX);
+    }
+    else if (tp == &PyDict_Type) {
+        state = PyDict_Copy(obj);
+    }
+    else if (tp == &PySet_Type) {
+        state = PyFrozenSet_New(obj);
+    }
+    else if (tp == &PyByteArray_Type) {
+        state = PyBytes_FromStringAndSize(PyByteArray_AS_STRING(obj), PyByteArray_GET_SIZE(obj));
+    }
+    else if (snapshots != NULL && PyDict_GetItemRef(snapshots, (PyObject *)tp, &pair) > 0) {
+        state = PyObject_CallOneArg(PyTuple_GET_ITEM(pair, 0), obj);
+        restore = PyTuple_GET_ITEM(pair, 1);
+    }
+    else if (!PyErr_Occurred()) {
+        _PyRestricted_Restore(tstate, saved);
+        Py_XDECREF(pair);
+        return refuse("a write that cannot be undone (no snapshot for the kind):", obj, NULL);
+    }
+    _PyRestricted_Restore(tstate, saved);
+    PyObject *entry = state == NULL ? NULL : PyTuple_Pack(3, obj, state, restore);
+    Py_XDECREF(state);
+    Py_XDECREF(pair);
+    if (entry == NULL || PyList_Append(undo, entry) < 0 || _Py_hashtable_set(undo_seen, obj, obj) < 0) {
+        Py_XDECREF(entry);
+        if (!PyErr_Occurred()) {
+            PyErr_NoMemory();
+        }
+        trip();     /* a write the run could not log must not happen */
+        return -1;
+    }
+    Py_DECREF(entry);
+    return 0;
+}
+
+/* Begin a run's log: 1 for the outermost run (a new epoch, an empty log), 0 for a nested one. */
+int
+_PyRestricted_UndoBegin(void)
+{
+    if (undo_depth++ > 0) {
+        return 0;
+    }
+    if (undo == NULL) {
+        undo = PyList_New(0);
+        undo_seen = _Py_hashtable_new(_Py_hashtable_hash_ptr, _Py_hashtable_compare_direct);
+        if (undo == NULL || undo_seen == NULL) {
+            undo_depth--;
+            PyErr_NoMemory();
+            return -1;
+        }
+    }
+    owned_epoch++;
+    return 1;
+}
+
+static int
+replay_one(PyObject *entry)
+{
+    PyObject *obj = PyTuple_GET_ITEM(entry, 0);
+    PyObject *state = PyTuple_GET_ITEM(entry, 1);
+    PyObject *restore = PyTuple_GET_ITEM(entry, 2);
+    PyTypeObject *tp = Py_TYPE(obj);
+    if (restore != Py_None) {
+        PyObject *r = PyObject_CallFunctionObjArgs(restore, obj, state, NULL);
+        Py_XDECREF(r);
+        return r == NULL ? -1 : 0;
+    }
+    if (tp == &PyList_Type || tp == &PyByteArray_Type) {
+        return PySequence_SetSlice(obj, 0, PY_SSIZE_T_MAX, state);
+    }
+    if (tp == &PyDict_Type) {
+        PyDict_Clear(obj);
+        return PyDict_Update(obj, state);
+    }
+    if (tp == &PySet_Type) {
+        return PySet_Clear(obj) < 0 ? -1 : _PySet_Update(obj, state);
+    }
+    return 0;
+}
+
+/* End a run's log, outermost only, with the gate already restored to the caller's state. `refused`: replay every
+   snapshot, newest first. Returns 0, or -1 when a replay failed (the caller reports it; the run is refused anyway). */
+int
+_PyRestricted_UndoEnd(int refused)
+{
+    if (--undo_depth > 0) {
+        return 0;
+    }
+    int rc = 0;
+    if (refused) {
+        PyObject *exc = PyErr_GetRaisedException();
+        for (Py_ssize_t i = PyList_GET_SIZE(undo) - 1; i >= 0; i--) {
+            if (replay_one(PyList_GET_ITEM(undo, i)) < 0) {
+                PyErr_Clear();
+                rc = -1;
+            }
+        }
+        PyErr_SetRaisedException(exc);
+    }
+    Py_SETREF(undo, PyList_New(0));
+    _Py_hashtable_clear(undo_seen);
+    owned_epoch++;      /* what this run made is now older than the next run */
+    if (undo == NULL) {
+        PyErr_Clear();
+        return -1;
+    }
+    return rc;
+}
+
+int
+_PyRestricted_AllowSnapshot(PyObject *type, PyObject *snapshot, PyObject *restore)
+{
+    if (ensure(&snapshots, new_dict) < 0) {
+        return -1;
+    }
+    PyObject *pair = PyTuple_Pack(2, snapshot, restore);
+    if (pair == NULL) {
+        return -1;
+    }
+    int r = PyDict_SetItem(snapshots, type, pair);
+    Py_DECREF(pair);
     return r;
 }
