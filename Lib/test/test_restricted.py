@@ -473,6 +473,11 @@ def give_back(x):
     return x
 
 
+def make_gen():
+    """A FRESH leaf returning a generator made in its lifted extent: the generator is in the owned set AND lifted_gens."""
+    return (i for i in range(2))
+
+
 class OwnershipTest(unittest.TestCase):
     """Slice 5: writes need a value the cell owns (made under the gate, or a FRESH leaf result), on every path: item
     writes, deletes, in-place operators, and a mutating method, which is not even read off a value the cell does not
@@ -590,6 +595,17 @@ class OwnershipTest(unittest.TestCase):
         xs = self.run_cell("return [1]")
         self.assertTrue(_restricted.owned(xs))
         self.assertFalse(_restricted.owned([1]))
+
+    def test_a_generator_in_both_tables_leaves_both(self):
+        _restricted.allow_call(make_gen, True)
+        _restricted.allow_fresh(make_gen)
+        ns = {"make_gen": make_gen}
+        self.run_cell("return 1", ns)           # the namespace's own entries exist before `before` is read
+        before = _restricted._table_sizes()
+        self.run_cell("g = make_gen()", ns)
+        self.assertTrue(_restricted.owned(ns["g"]))
+        del ns["g"]
+        self.assertEqual(_restricted._table_sizes(), before)   # a stale lifted_gens entry resumes a later one lifted
 
 
 class MemoryTest(unittest.TestCase):

@@ -669,11 +669,15 @@ ref_tracer(PyObject *op, PyRefTracerEvent event, void *data)
             }
         }
     }
-    else if (ntracked && is_tracked(tp)) {
-        (void)_Py_hashtable_steal(owned, op);
-    }
-    else if (is_generator_type(tp) && _Py_hashtable_len(lifted_gens)) {
-        (void)_Py_hashtable_steal(lifted_gens, op);
+    else {
+        /* Both, not either: a generator made in a lifted extent and returned by a FRESH leaf is in both tables, and
+           a stale lifted_gens entry would resume a later generator at that address lifted. */
+        if (ntracked && is_tracked(tp)) {
+            (void)_Py_hashtable_steal(owned, op);
+        }
+        if (is_generator_type(tp) && _Py_hashtable_len(lifted_gens)) {
+            (void)_Py_hashtable_steal(lifted_gens, op);
+        }
     }
     return 0;
 }
@@ -727,6 +731,14 @@ int
 _PyRestricted_IsOwned(PyObject *obj)
 {
     return is_owned(obj);
+}
+
+/* Test hook: the sizes of the owned set and lifted_gens, so a test can see an entry outlive its object. */
+void
+_PyRestricted_TableSizes(Py_ssize_t *n_owned, Py_ssize_t *n_lifted_gens)
+{
+    *n_owned = owned == NULL ? 0 : (Py_ssize_t)_Py_hashtable_len(owned);
+    *n_lifted_gens = lifted_gens == NULL ? 0 : (Py_ssize_t)_Py_hashtable_len(lifted_gens);
 }
 
 /* Mark a lifted leaf's FRESH result owned. Refused as a marking (left unowned) when it is the receiver or an

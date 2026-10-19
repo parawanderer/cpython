@@ -254,6 +254,15 @@ restricted_owned(PyObject *module, PyObject *obj)
     return PyBool_FromLong(_PyRestricted_IsOwned(obj));
 }
 
+/* _table_sizes(): (len(owned set), len(lifted generators)), for tests. */
+static PyObject *
+restricted_table_sizes(PyObject *module, PyObject *unused)
+{
+    Py_ssize_t a, b;
+    _PyRestricted_TableSizes(&a, &b);
+    return Py_BuildValue("(nn)", a, b);
+}
+
 /* memory(): the most heap the last run held at once, in bytes (RAW blocks and arenas). */
 static PyObject *
 restricted_memory(PyObject *module, PyObject *unused)
@@ -416,6 +425,8 @@ static PyMethodDef restricted_methods[] = {
      "write_barrier(obj, /)\n--\n\nLog obj's contents before a lifted leaf writes it."},
     {"owned", restricted_owned, METH_O,
      "owned(obj, /)\n--\n\nWhether obj is the cell's own."},
+    {"_table_sizes", restricted_table_sizes, METH_NOARGS,
+     "_table_sizes()\n--\n\nThe sizes of the owned set and of the lifted generators' table (tests)."},
     {"memory", restricted_memory, METH_NOARGS,
      "memory()\n--\n\nThe most heap the last run held at once, in bytes."},
     {"steps", restricted_steps, METH_NOARGS,

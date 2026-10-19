@@ -107,6 +107,8 @@ extern int _PyRestricted_IsLiftedGen(PyObject *gen);
 PyAPI_FUNC(int) _PyRestricted_IsOwned(PyObject *obj);
 extern int _PyRestricted_CheckInPlace(PyObject *v);
 PyAPI_FUNC(int) _PyRestricted_OwnedReady(void);
+/* Test hook: the sizes of the owned set and of the lifted generators' table. */
+PyAPI_FUNC(void) _PyRestricted_TableSizes(Py_ssize_t *n_owned, Py_ssize_t *n_lifted_gens);
 
 /* Memory (slice 5): a byte cap per run, counted at the RAW and arena allocators. */
 PyAPI_FUNC(int) _PyRestricted_MemoryBegin(long long limit);
