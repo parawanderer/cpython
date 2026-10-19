@@ -1198,6 +1198,9 @@ sequence_repeat(ssizeargfunc repeatfunc, PyObject *seq, PyObject *n)
 {
     Py_ssize_t count;
     if (_PyIndex_Check(n)) {
+        if (_PyRestricted_RepeatAdmit(seq, n) < 0) {
+            return PyErr_NoMemory();
+        }
         count = PyNumber_AsSsize_t(n, PyExc_OverflowError);
         if (count == -1 && PyErr_Occurred()) {
             return NULL;

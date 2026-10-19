@@ -768,6 +768,38 @@ class MemoryTest(unittest.TestCase):
         self.assertEqual(len("a" * 10 ** 7), 10 ** 7, "the host allocates freely after a run")
         self.assertEqual(self.run_cell("return len([0] * 10 ** 6)"), 10 ** 6, "the next run gets a fresh cap")
 
+    def test_a_repeat_past_py_ssize_t_is_the_cap(self):
+        # CPython's own guards refuse these with no allocation (OverflowError, MemoryError), so they never tripped the
+        # run. 10 ** 20 is past Py_ssize_t here as 10 ** 11 is on wasm32, where the halting vector met it.
+        for src in ('return len("a" * 10 ** 20)', 'return len("ab" * 2 ** 62)', "return len([0, 0] * 2 ** 62)",
+                    'return len(b"a" * 10 ** 20)', "return len((1,) * 10 ** 20)", 'x = "a"\nx *= 10 ** 20\nreturn x',
+                    'return len(10 ** 20 * "a")'):
+            self.refused(src)
+
+    def test_an_empty_or_negative_repeat_is_not_judged(self):
+        # Neither asks for memory, so each keeps CPython's own error: past Py_ssize_t is an OverflowError either way.
+        self.assertEqual(self.run_cell('return len("a" * -10 ** 6)'), 0)
+        for src in ('return len("" * 10 ** 20)', 'return len("a" * -10 ** 20)', "return len([] * 10 ** 20)"):
+            with self.assertRaises(OverflowError, msg=src):
+                self.run_cell(src)
+        with self.assertRaises(OverflowError):
+            "a" * 10 ** 20      # the host's repeat is CPython's, outside a run
+
+
+class MallocMemoryTest(unittest.TestCase):
+    """The cap without pymalloc: Emscripten (Pyodide) and WASI build --without-pymalloc, where the MEM and OBJ domains
+    call malloc and never reach RAW or the arenas. PYTHONMALLOC=malloc is the same wiring on this build."""
+
+    def test_memory_test_passes_under_malloc(self):
+        from test.support.script_helper import assert_python_ok
+        code = ("import sys, unittest, _testinternalcapi\n"
+                "assert _testinternalcapi.pymem_getallocatorsname() == 'malloc', _testinternalcapi.pymem_getallocatorsname()\n"
+                "from test.test_restricted import MemoryTest\n"
+                "r = unittest.TextTestRunner(stream=sys.stdout, verbosity=2).run("
+                "unittest.defaultTestLoader.loadTestsFromTestCase(MemoryTest))\n"
+                "sys.exit(not r.wasSuccessful())\n")
+        rc, out, err = assert_python_ok("-c", code, PYTHONMALLOC="malloc", __isolated=False)
+
 
 class Frame:
     """A stand-in for a pandas object: Python dunders that read internals the gate would refuse, and a __getitem__

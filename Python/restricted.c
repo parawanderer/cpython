@@ -26,6 +26,7 @@
 #include "pycore_tuple.h"         // _PyTuple_FromArray()
 #include "pycore_hashtable.h"     // _Py_hashtable_t: the owned set
 #include "pycore_setobject.h"     // _PySet_Update()
+#include "pycore_pymem.h"         // _PyMem_GetCurrentAllocatorName()
 
 static PyObject *kinds;           // dict: type -> frozenset[str]
 static PyObject *modules;         // dict: str -> frozenset[str]
@@ -806,25 +807,31 @@ _PyRestricted_AllowFresh(PyObject *callable)
 
 /* --- memory: a byte cap per run (slice 5) ---
 
-   The native form of the JS dialect's size caps. CPython's RAW allocator domain receives every block over 512 bytes
-   (pymalloc hands those to PyMem_RawMalloc) and the arena allocator every arena of small objects, so wrapping those
-   two counts the heap a run adds, net of what it frees, at almost no cost per small object. A request that would
-   take the run past its cap FAILS before anything is allocated (so "a" * 10**11 is refused in microseconds instead of
-   touching 100 GB), and trips the run, so the MemoryError the caller raises ends as NotInDialect however it is
-   handled. The wrappers are installed once, as hooks that call the previous allocator (the documented way to hook
-   after initialization), and count only on the running thread while a run is in progress.
+   The native form of the JS dialect's size caps. Under pymalloc, CPython's RAW allocator domain receives every block
+   over 512 bytes (pymalloc hands those to PyMem_RawMalloc) and the arena allocator every arena of small objects, so
+   wrapping those two counts the heap a run adds, net of what it frees, at almost no cost per small object. Without
+   pymalloc (Emscripten and WASI build --without-pymalloc, so this is Pyodide's case; also PYTHONMALLOC=malloc or
+   mimalloc) the MEM and OBJ domains call malloc directly and never reach RAW, so they are wrapped too, each block
+   counted. A request that would take the run past its cap FAILS before anything is allocated (so "a" * 10**11 is
+   refused in microseconds instead of touching 100 GB), and trips the run, so the MemoryError the caller raises ends as
+   NotInDialect however it is handled. The wrappers are installed once, as hooks that call the previous allocator (the
+   documented way to hook after initialization), and count only on the running thread while a run is in progress.
+
+   A request CPython refuses with its own overflow guard never reaches an allocator: on a 32-bit build "a" * 10**11
+   fails converting the count to Py_ssize_t, an OverflowError and not the cap. _PyRestricted_RepeatAdmit judges a
+   sequence repeat's size before that guard (Objects/abstract.c, sequence_repeat).
 
    Not counted: memory a C library takes from malloc directly, which includes numpy's array data (PyDataMem). A numpy
    leaf's cost and size are its manifest's (tier 1 bounds over shape), not this cap's. */
 
-static PyMemAllocatorEx raw_orig;
+static PyMemAllocatorEx raw_orig, mem_orig, obj_orig;     /* each wrapper's ctx is the domain's previous allocator */
 static PyObjectArenaAllocator arena_orig;
 static int mem_installed;
 static int mem_counting;
 static unsigned long mem_thread;
 static long long mem_live, mem_peak, mem_limit;
 static int mem_tripped;
-static _Py_hashtable_t *mem_blocks;         /* block -> size, for the blocks a run allocated through RAW */
+static _Py_hashtable_t *mem_blocks;         /* block -> size, for the blocks a run allocated through a wrapped domain */
 
 static void *ht_malloc(size_t n) { return raw_orig.malloc(raw_orig.ctx, n); }
 static void ht_free(void *p) { raw_orig.free(raw_orig.ctx, p); }
@@ -875,22 +882,24 @@ mem_forget(void *p)
 }
 
 static void *
-raw_malloc(void *ctx, size_t n)
+counted_malloc(void *ctx, size_t n)
 {
+    PyMemAllocatorEx *o = ctx;
     if (!mem_mine()) {
-        return raw_orig.malloc(raw_orig.ctx, n);
+        return o->malloc(o->ctx, n);
     }
     if (!mem_admit((long long)n)) {
         return NULL;
     }
-    return mem_record(raw_orig.malloc(raw_orig.ctx, n), n);
+    return mem_record(o->malloc(o->ctx, n), n);
 }
 
 static void *
-raw_calloc(void *ctx, size_t nelem, size_t elsize)
+counted_calloc(void *ctx, size_t nelem, size_t elsize)
 {
+    PyMemAllocatorEx *o = ctx;
     if (!mem_mine()) {
-        return raw_orig.calloc(raw_orig.ctx, nelem, elsize);
+        return o->calloc(o->ctx, nelem, elsize);
     }
     if (elsize != 0 && nelem > (size_t)PY_SSIZE_T_MAX / elsize) {
         mem_tripped = 1;
@@ -900,14 +909,15 @@ raw_calloc(void *ctx, size_t nelem, size_t elsize)
     if (!mem_admit((long long)n)) {
         return NULL;
     }
-    return mem_record(raw_orig.calloc(raw_orig.ctx, nelem, elsize), n);
+    return mem_record(o->calloc(o->ctx, nelem, elsize), n);
 }
 
 static void *
-raw_realloc(void *ctx, void *ptr, size_t n)
+counted_realloc(void *ctx, void *ptr, size_t n)
 {
+    PyMemAllocatorEx *o = ctx;
     if (!mem_mine()) {
-        return raw_orig.realloc(raw_orig.ctx, ptr, n);
+        return o->realloc(o->ctx, ptr, n);
     }
     long long old = mem_forget(ptr);          /* 0 for a block from before the run: then all of n counts */
     if (!mem_admit((long long)n - old)) {
@@ -916,7 +926,7 @@ raw_realloc(void *ctx, void *ptr, size_t n)
         }
         return NULL;
     }
-    void *p = raw_orig.realloc(raw_orig.ctx, ptr, n);
+    void *p = o->realloc(o->ctx, ptr, n);
     if (p == NULL) {
         if (old) {
             (void)_Py_hashtable_set(mem_blocks, ptr, (void *)(uintptr_t)old);
@@ -928,12 +938,13 @@ raw_realloc(void *ctx, void *ptr, size_t n)
 }
 
 static void
-raw_free(void *ctx, void *ptr)
+counted_free(void *ctx, void *ptr)
 {
+    PyMemAllocatorEx *o = ctx;
     if (mem_mine()) {
         mem_live -= mem_forget(ptr);
     }
-    raw_orig.free(raw_orig.ctx, ptr);
+    o->free(o->ctx, ptr);
 }
 
 static void *
@@ -975,10 +986,20 @@ mem_install(void)
         PyErr_NoMemory();
         return -1;
     }
-    PyMemAllocatorEx raw = {NULL, raw_malloc, raw_calloc, raw_realloc, raw_free};
+    PyMemAllocatorEx raw = {&raw_orig, counted_malloc, counted_calloc, counted_realloc, counted_free};
     PyObjectArenaAllocator arena = {NULL, arena_alloc, arena_free};
     PyMem_SetAllocator(PYMEM_DOMAIN_RAW, &raw);
     PyObject_SetArenaAllocator(&arena);
+    /* Only pymalloc routes MEM and OBJ through RAW and the arenas; wrapping them under it would count a block twice. */
+    const char *name = _PyMem_GetCurrentAllocatorName();
+    if (name == NULL || (strcmp(name, "pymalloc") != 0 && strcmp(name, "pymalloc_debug") != 0)) {
+        PyMem_GetAllocator(PYMEM_DOMAIN_MEM, &mem_orig);
+        PyMem_GetAllocator(PYMEM_DOMAIN_OBJ, &obj_orig);
+        PyMemAllocatorEx mem = {&mem_orig, counted_malloc, counted_calloc, counted_realloc, counted_free};
+        PyMemAllocatorEx obj = {&obj_orig, counted_malloc, counted_calloc, counted_realloc, counted_free};
+        PyMem_SetAllocator(PYMEM_DOMAIN_MEM, &mem);
+        PyMem_SetAllocator(PYMEM_DOMAIN_OBJ, &obj);
+    }
     mem_installed = 1;
     return 0;
 }
@@ -1017,6 +1038,49 @@ int
 _PyRestricted_MemoryTripped(void)
 {
     return mem_counting && mem_tripped;
+}
+
+/* May `seq * n` be made? A repeat of a str, bytes, bytearray, list or tuple asks for at least len * n items of its
+   narrowest element, judged here against the cap before CPython's own overflow guards (a count past Py_ssize_t, a
+   product past it), which refuse without asking an allocator and so never trip the run. The estimate never exceeds
+   what the allocation would take, so it refuses nothing the allocator would admit. 0 = go on, -1 = tripped. */
+int
+_PyRestricted_RepeatAdmit(PyObject *seq, PyObject *n)
+{
+    int sign;
+    if (!mem_mine() || !PyLong_Check(n) || PyLong_GetSign(n, &sign) < 0 || sign <= 0) {
+        return 0;
+    }
+    Py_ssize_t len;
+    double item;
+    if (PyUnicode_Check(seq)) {
+        len = PyUnicode_GET_LENGTH(seq);
+        item = PyUnicode_KIND(seq);
+    }
+    else if (PyBytes_Check(seq) || PyByteArray_Check(seq)) {
+        len = Py_SIZE(seq);
+        item = 1;
+    }
+    else if (PyList_Check(seq) || PyTuple_Check(seq)) {
+        len = Py_SIZE(seq);
+        item = sizeof(PyObject *);
+    }
+    else {
+        return 0;
+    }
+    if (len == 0) {
+        return 0;
+    }
+    double count = PyLong_AsDouble(n);
+    if (count == -1.0 && PyErr_Occurred()) {
+        PyErr_Clear();                      /* past a double: past any cap */
+        count = Py_HUGE_VAL;
+    }
+    if ((double)mem_live + (double)len * item * count > (double)mem_limit) {
+        mem_tripped = 1;
+        return -1;
+    }
+    return 0;
 }
 
 
