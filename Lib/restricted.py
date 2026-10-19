@@ -5,8 +5,9 @@ legal and is the cell's value. Every code object in the result, the cell's own a
 comprehension, carries ``CO_RESTRICTED``, so a callback the cell hands to a C leaf is recognised as restricted when the
 leaf calls it back. Membership is checked BEFORE compiling: every node must be in the whitelist (window-ml's
 notebooks/python-dialect/data/whitelist.json, the one ratchet), a generator expression is admitted only as the sole
-positional argument of a listed consumer and is rewritten to a list comprehension there, and a dunder name or
-attribute is refused outright. A refusal here is NotInDialect before anything runs.
+positional argument of a listed consumer and is rewritten to a list comprehension there, a ``print(...)`` call is
+rewritten to convert its arguments with the cell's own ``str()`` (print_call), and a dunder name or attribute is
+refused outright. A refusal here is NotInDialect before anything runs.
 """
 
 import ast
@@ -15,8 +16,8 @@ import _restricted
 
 NotInDialect = _restricted.NotInDialect
 
-__all__ = ["compile_cell", "run_cell", "mark", "load_manifests", "CO_RESTRICTED", "DEFAULT_BUDGET", "DEFAULT_MEMORY",
-           "MAX_COLLECTION"]
+__all__ = ["compile_cell", "run_cell", "mark", "load_manifests", "allow_print", "CO_RESTRICTED", "DEFAULT_BUDGET",
+           "DEFAULT_MEMORY", "MAX_COLLECTION"]
 
 CO_RESTRICTED = _restricted.CO_RESTRICTED
 # Steps a run gets when the caller names none. A step is one periodic check (a backward jump or a call), so it is far
@@ -62,14 +63,41 @@ class _Membership(ast.NodeTransformer):
 
     def visit_Call(self, node):
         f = node.func
+        if isinstance(f, ast.Name) and f.id == "print":
+            return self.print_call(node)
         consumer = (isinstance(f, ast.Name) and f.id in CONSUMERS) or (isinstance(f, ast.Attribute) and f.attr == "join")
         if consumer and len(node.args) == 1 and isinstance(node.args[0], ast.GeneratorExp):
             g = node.args[0]
             node.args[0] = ast.copy_location(ast.ListComp(elt=g.elt, generators=g.generators), g)
         return self.generic_visit(node)
 
+    def print_call(self, node):
+        """``print(a, *b, sep=s)`` becomes ``__cell_print__(str(a), *[str(x) for x in b], sep=s)``: each argument is
+        converted by the cell's own (gated) ``str()``, so print admits exactly what ``str()`` admits, and the lifted
+        writer only ever handles plain strings. ``file=`` and ``**`` are refused (the only stream is the host's)."""
+        for k in node.keywords:
+            if k.arg is None:
+                self.refuse(node, "print(**...)")
+            if k.arg not in ("sep", "end", "flush"):
+                self.refuse(node, f"print({k.arg}=...)")
+        node.args = [self.visit(a) for a in node.args]
+        node.keywords = [self.visit(k) for k in node.keywords]
+        to_str = lambda e: ast.copy_location(ast.Call(ast.Name("str", ast.Load()), [e], []), e)
+        args = []
+        for a in node.args:
+            if isinstance(a, ast.Starred):
+                x = ast.Name("__x__", ast.Load())
+                comp = ast.ListComp(elt=to_str(x), generators=[
+                    ast.comprehension(ast.Name("__x__", ast.Store()), a.value, [], 0)])
+                args.append(ast.copy_location(ast.Starred(ast.copy_location(comp, a), ast.Load()), a))
+            else:
+                args.append(to_str(a))
+        return ast.copy_location(ast.Call(ast.Name("__cell_print__", ast.Load()), args, node.keywords), node)
+
     def generic_visit(self, node):
         kind = type(node).__name__
+        if isinstance(node, ast.Name) and node.id == "print":
+            self.refuse(node, "print other than called directly")
         if kind == "GeneratorExp":
             self.refuse(node, "a generator expression outside consumer position")
         if kind not in self.nodes:
@@ -131,10 +159,36 @@ def _top_targets(stmt):
 def run_cell(source, namespace, nodes=DEFAULT_NODES, budget=None, depth=None, memory=None):
     """Check, compile and run a cell in ``namespace`` (a dict) with the thread restricted; return the cell's value.
     ``budget`` is the step budget (DEFAULT_BUDGET when None), ``depth`` the deepest the cell's own frames may nest,
-    ``memory`` the bytes the cell may add to the heap (DEFAULT_MEMORY)."""
-    _restricted.run(compile_cell(source, nodes=nodes), namespace, budget, depth, memory)
+    ``memory`` the bytes the cell may add to the heap (DEFAULT_MEMORY). What the cell printed before a refusal has
+    already reached ``sys.stdout``: the undo log restores values, not output, so the host drops or marks it."""
+    code = compile_cell(source, nodes=nodes)
+    namespace["__cell_print__"] = cell_print
+    try:
+        _restricted.run(code, namespace, budget, depth, memory)
+    finally:
+        namespace.pop("__cell_print__", None)
     namespace.pop("_user", None)
     return namespace.pop("__cell_result__", None)
+
+
+def cell_print(*texts, sep=None, end=None, flush=False):
+    """The writer a cell's ``print(...)`` is compiled to call (``__cell_print__`` in its namespace): plain strings,
+    already converted under the gate, written to ``sys.stdout``. Lifted behind _print_check (allow_print)."""
+    print(*texts, sep=sep, end=end, flush=flush)
+
+
+def _print_check(func, self, args, kwargs):
+    if not all(type(t) is str for t in args):
+        raise NotInDialect("not in dialect: print() of a value str() did not turn into a str")
+    kwargs = kwargs or {}
+    if (any(type(kwargs.get(k)) not in (str, type(None)) for k in ("sep", "end"))
+            or type(kwargs.get("flush", False)) is not bool):
+        raise NotInDialect("not in dialect: print()'s sep and end must be str or None, flush a bool")
+
+
+def allow_print():
+    """Let cells print: list the writer a cell's ``print(...)`` compiles to, lifted behind its check."""
+    _restricted.allow_call(cell_print, True, _print_check)
 
 
 # Leaves that resolve a NAME they are given, or call a callable they are given: lifted only behind an ENTRY CHECK
@@ -355,6 +409,7 @@ def load_manifests(data_dir):
         _restricted.allow_kind(containers[kind], names)
         done["kinds"][kind] = names
     _restricted.allow_kind(range, ["[]"])
+    allow_print()
     for t, names in MUTATORS.items():
         _restricted.allow_mutators(t, names)
 
