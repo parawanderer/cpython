@@ -821,6 +821,90 @@ class UndoTest(unittest.TestCase):
         self.assertNotIn("zs", ns)
 
 
+class PrintTest(unittest.TestCase):
+    """print() in a cell: each argument converted by the cell's own gated str(), the lifted writer handed only
+    strings, and nothing but the host's stream reachable. The corpus prints in a fifth of its cells."""
+
+    def setUp(self):
+        for f in (str, len, range, list):
+            _restricted.allow_call(f, False)
+        _restricted.allow_kind(list, ["[]"])
+        _restricted.allow_kind(str, ["upper"])
+        restricted.allow_print()
+
+    def tearDown(self):
+        _restricted.reset()
+
+    def printed(self, src, **names):
+        import contextlib, io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            value = restricted.run_cell(src, dict(names))
+        return out.getvalue(), value
+
+    def test_print_writes_what_str_makes(self):
+        self.assertEqual(self.printed("print(1, 'a', 2.5, None, [1, 'b'])")[0], "1 a 2.5 None [1, 'b']\n")
+        self.assertEqual(self.printed("print('a', 'b', sep='-', end='!')")[0], "a-b!")
+        self.assertEqual(self.printed("print()")[0], "\n")
+        self.assertEqual(self.printed("xs = [1, 2]\nprint(*xs, sep=',')")[0], "1,2\n")
+        self.assertEqual(self.printed("print(f'{len([1, 2])} rows', flush=True)")[0], "2 rows\n")
+
+    def test_print_in_a_function_and_a_loop(self):
+        out, value = self.printed("def show(x):\n    print(x.upper())\nfor i in range(3):\n    show('r' + str(i))\nreturn 7")
+        self.assertEqual((out, value), ("R0\nR1\nR2\n", 7))
+
+    def test_print_admits_only_what_str_admits(self):
+        # a Python __str__ runs under the gate (its kind lists no "__^"): what str() refuses there, print refuses too
+        class Secretive:
+            def __str__(self):
+                return str(self._hidden)
+        import contextlib, io
+        out = io.StringIO()
+        for src in ("return str(s)", "print(s)", "print('first', s)"):
+            with self.subTest(src=src), contextlib.redirect_stdout(out):
+                with self.assertRaisesRegex(restricted.NotInDialect, "_hidden"):
+                    restricted.run_cell(src, {"s": Secretive()})
+        self.assertEqual(out.getvalue(), "")
+
+    def test_no_stream_but_the_hosts(self):
+        for src in ("print('x', file=xs)", "print(**kw)", "print('x', file=None)", "print('x', foo=1)"):
+            with self.subTest(src=src), self.assertRaisesRegex(restricted.NotInDialect, "print"):
+                self.printed(src, xs=[], kw={"file": []})
+
+    def test_print_is_only_called(self):
+        for src in ("p = print\np('x')", "list(map(print, ['x']))", "return print", "print = len\nreturn 1"):
+            with self.subTest(src=src), self.assertRaisesRegex(restricted.NotInDialect, "print"):
+                self.printed(src)
+
+    def test_the_writer_takes_only_strings(self):
+        # a cell that rebinds str gets its values to the writer unconverted: the writer's check refuses them
+        _restricted.allow_call(int, False)
+        with self.assertRaisesRegex(restricted.NotInDialect, "str"):
+            self.printed("str = int\nprint(5)")
+        with self.assertRaisesRegex(restricted.NotInDialect, "sep"):
+            self.printed("print('a', sep=1)")
+        with self.assertRaisesRegex(restricted.NotInDialect, "flush"):
+            self.printed("print('a', flush=1)")
+
+    def test_the_writer_is_not_the_cells_name(self):
+        with self.assertRaisesRegex(restricted.NotInDialect, "__cell_print__"):
+            self.printed("__cell_print__('x')")
+        ns = {}
+        restricted.run_cell("return 1", ns)
+        self.assertNotIn("__cell_print__", ns)
+
+    def test_output_before_a_refusal_has_already_left(self):
+        import contextlib, io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(restricted.NotInDialect):
+            restricted.run_cell("print('before')\nreturn box.secret", {"box": Box()})
+        self.assertEqual(out.getvalue(), "before\n")
+
+    def test_printing_in_a_loop_is_metered(self):
+        import contextlib, io
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(restricted.NotInDialect, "budget"):
+            restricted.run_cell("for i in range(1000000):\n    print(i)", {}, budget=1000)
+
 try:
     import warnings
     with warnings.catch_warnings():     # numpy adds filters at import; keep the test environment as it was
@@ -858,6 +942,16 @@ class StockWheelsTest(unittest.TestCase):
 
     def run_cell(self, src, **names):
         return restricted.run_cell(src, dict(names))
+
+    def test_print_a_frame(self):
+        import contextlib, io
+        restricted.allow_print()
+        _restricted.allow_call(str, False)
+        out = io.StringIO()
+        df = self.df()
+        with contextlib.redirect_stdout(out):
+            self.run_cell("print(df)\nprint(df['a'].sum(), len(df))", df=df)
+        self.assertEqual(out.getvalue(), str(df) + "\n6 3\n")
 
     def test_the_wheels_are_stock(self):
         self.assertFalse(any(_restricted.build().values()))
