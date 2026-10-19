@@ -5,6 +5,7 @@ the observable, called from inside the code under test. The dialect vectors (win
 tests/fixtures/dialect-vectors/) are the acceptance suite once the gate exists.
 """
 
+import gc
 import unittest
 
 import _restricted
@@ -478,6 +479,17 @@ def make_gen():
     return (i for i in range(2))
 
 
+def plain_gen():
+    """A lifted leaf that is NOT fresh: its generator is only in lifted_gens."""
+    return (i for i in range(2))
+
+
+def probe_gen():
+    """Created under the gate (not fresh, not lifted): its body must resume gated. A stale lifted_gens entry at this
+    address would resume it lifted, and `().__class__` would yield instead of being refused."""
+    yield ().__class__
+
+
 class OwnershipTest(unittest.TestCase):
     """Slice 5: writes need a value the cell owns (made under the gate, or a FRESH leaf result), on every path: item
     writes, deletes, in-place operators, and a mutating method, which is not even read off a value the cell does not
@@ -606,6 +618,102 @@ class OwnershipTest(unittest.TestCase):
         self.assertTrue(_restricted.owned(ns["g"]))
         del ns["g"]
         self.assertEqual(_restricted._table_sizes(), before)   # a stale lifted_gens entry resumes a later one lifted
+
+
+class AddressReuseTest(unittest.TestCase):
+    """The address-keyed tables follow the heap. An entry is removed when its object dies (PyRefTracer DESTROY,
+    which fires before the freelist or GC can hand the address out again), unconditionally and independently of
+    the other tables. A stale owned entry would let a later object at that address be written as the cell's own; a
+    stale lifted_gens entry would resume a later generator at that address outside the gate. Both, not either: a
+    generator made in a lifted extent and returned by a FRESH leaf sits in both tables and must leave both."""
+
+    def setUp(self):
+        for f in (len, list, range, next):
+            _restricted.allow_call(f, False)
+        _restricted.allow_kind(list, ["append", "[]", "[]="])
+        _restricted.allow_call(make_gen, True)
+        _restricted.allow_fresh(make_gen)
+        _restricted.allow_call(plain_gen, True)
+        _restricted.allow_call(probe_gen, False)    # under the gate: its body stays gated
+
+    def tearDown(self):
+        _restricted.reset()
+
+    def run_cell(self, src, ns=None, **names):
+        ns = {} if ns is None else ns
+        ns.update(names, make_gen=make_gen, plain_gen=plain_gen, probe_gen=probe_gen)
+        return restricted.run_cell(src, ns)
+
+    # --- removal is synchronous with death ---
+
+    def test_an_owned_entry_is_gone_at_del_before_anything_reuses_the_address(self):
+        xs = self.run_cell("return [1]")
+        before = _restricted._table_sizes()
+        self.assertTrue(_restricted.owned(xs))
+        del xs
+        self.assertEqual(_restricted._table_sizes(), (before[0] - 1, before[1]))
+
+    def test_a_lifted_entry_is_gone_at_del_before_anything_reuses_the_address(self):
+        ns = {}
+        self.run_cell("g = plain_gen()", ns)
+        before = _restricted._table_sizes()
+        del ns["g"]
+        self.assertEqual(_restricted._table_sizes(), (before[0], before[1] - 1))
+
+    # --- cycle collection takes the same path ---
+
+    def test_a_cycle_of_owned_lists_leaves_the_table(self):
+        before = _restricted._table_sizes()
+        self.run_cell("pairs = []\nfor i in range(50):\n    a = [i]\n    b = [a]\n    a.append(b)\n    pairs.append(a)\n"
+                      "pairs = None\nreturn 1")
+        gc.collect()
+        self.assertEqual(_restricted._table_sizes(), before)
+        made = [[i] for i in range(2000)]
+        self.assertFalse(any(_restricted.owned(x) for x in made))
+
+    def test_a_generator_in_a_cycle_leaves_both_tables(self):
+        ns = {"make_gen": make_gen}
+        self.run_cell("return 1", ns)
+        before = _restricted._table_sizes()
+        self.run_cell("g = make_gen()\nbox = [g]\ng = None\nbox.append(box)\nbox = None\nreturn 1", ns)
+        gc.collect()
+        self.assertEqual(_restricted._table_sizes(), before)
+
+    def test_a_lifted_only_generator_in_a_cycle_leaves_lifted_gens(self):
+        ns = {"plain_gen": plain_gen}
+        self.run_cell("return 1", ns)
+        before = _restricted._table_sizes()
+        self.run_cell("g = plain_gen()\nbox = [g]\ng = None\nbox.append(box)\nbox = None\nreturn 1", ns)
+        gc.collect()
+        self.assertEqual(_restricted._table_sizes(), before)
+
+    # --- a reused address is never owned or lifted by accident ---
+
+    def test_a_probe_generator_after_a_freed_lifted_one_resumes_gated(self):
+        self.run_cell("gs = [plain_gen() for _ in range(300)]\ngs = None\nreturn 1")
+        # Every probe is created under the gate and resumed under the gate, one cell each: a stale lifted_gens
+        # entry at a reused address would resume that one lifted, and `().__class__` would yield instead of
+        # being refused. (A caught refusal inside one cell would trip the run, so each resume is its own cell.)
+        made = self.run_cell("return [probe_gen() for _ in range(300)]")
+        for g in made:
+            with self.assertRaises(_restricted.NotInDialect):
+                self.run_cell("return next(g)", {"g": g, "next": next})
+
+    def test_a_probe_generator_after_a_cycle_collected_lifted_one_resumes_gated(self):
+        self.run_cell("gs = [plain_gen() for _ in range(200)]\nbox = [gs]\ngs = None\nbox.append(box)\nbox = None\n"
+                      "return 1")
+        gc.collect()
+        made = self.run_cell("return [probe_gen() for _ in range(200)]")
+        for g in made:
+            with self.assertRaises(_restricted.NotInDialect):
+                self.run_cell("return next(g)", {"g": g, "next": next})
+
+    def test_the_tables_do_not_grow_across_many_runs(self):
+        self.run_cell("return 1", {})
+        before = _restricted._table_sizes()
+        for i in range(20):
+            self.run_cell("t = [i]\ng = plain_gen()\ndel t, g\nreturn 1", {"i": i})
+        self.assertEqual(_restricted._table_sizes(), before)
 
 
 class MemoryTest(unittest.TestCase):
