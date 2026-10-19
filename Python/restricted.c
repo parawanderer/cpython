@@ -602,6 +602,49 @@ _PyRestricted_Tick(PyThreadState *tstate)
 
 static _Py_hashtable_t *owned;      /* value: the run epoch the object became owned in */
 static uintptr_t owned_epoch = 1;   /* the current outermost run's epoch (never 0, which reads as "absent") */
+
+/* A filter in front of the owned set and lifted_gens: one bit per hashed address, set for every pointer either table
+   holds, so a clear bit means "in neither". It is what lets a deallocation, which the tracer sees for every object,
+   skip the type scan and the table lookup.
+
+   A member's bit is never clear. Bits are only ever set, except by owned_filter_rebuild, which recomputes them from
+   the two tables, and owned_reset, which empties the tables too. The direction matters: a deallocation that wrongly
+   skipped the table would leave a freed address in the set, and the next object at that address would read as owned.
+   In front of a LOOKUP the filter's failure would be the other way, "not owned" for a member, which refuses a write
+   (test_restricted asserts both). */
+#define OWNED_FILTER_LOG2 16
+static uint64_t owned_filter[(1 << OWNED_FILTER_LOG2) / 64];
+static int owned_filter_force_miss;     /* test only: lookups read every bit as clear; deallocations never do */
+static size_t owned_filter_adds;        /* bits set since the last rebuild: a rebuild waits for a quarter of the bits */
+
+static inline size_t
+owned_filter_slot(const void *p)
+{
+    return (size_t)(((uintptr_t)p * (uintptr_t)0x9E3779B97F4A7C15ull) >> (64 - OWNED_FILTER_LOG2));
+}
+
+static inline void
+owned_filter_add(const void *p)
+{
+    size_t i = owned_filter_slot(p);
+    owned_filter[i >> 6] |= (uint64_t)1 << (i & 63);
+    owned_filter_adds++;
+}
+
+static inline int
+owned_filter_maybe(const void *p)
+{
+    size_t i = owned_filter_slot(p);
+    return (owned_filter[i >> 6] >> (i & 63)) & 1;
+}
+
+/* Add to the owned set; the bit first, so no member is ever without one. On failure: simply not owned. */
+static void
+owned_add(PyObject *op, uintptr_t epoch)
+{
+    owned_filter_add(op);
+    (void)_Py_hashtable_set(owned, op, (void *)epoch);
+}
 #define MAX_TRACKED 32
 static PyTypeObject *tracked[MAX_TRACKED];      /* types whose instances may be in the set */
 static int ntracked;
@@ -657,7 +700,7 @@ ref_tracer(PyObject *op, PyRefTracerEvent event, void *data)
         if (owned_on_create(tp)) {
             PyThreadState *tstate = _PyThreadState_GET();
             if (tstate != NULL && _PyRestricted_Active(tstate)) {
-                (void)_Py_hashtable_set(owned, op, (void *)owned_epoch);  /* on failure: simply not owned */
+                owned_add(op, owned_epoch);
             }
         }
         else if (is_generator_type(tp)) {
@@ -665,15 +708,19 @@ ref_tracer(PyObject *op, PyRefTracerEvent event, void *data)
             if (tstate != NULL && ((_PyThreadStateImpl *)tstate)->restricted_lifted
                 && !_PyRestricted_Active(tstate))
             {
+                owned_filter_add(op);
                 (void)_Py_hashtable_set(lifted_gens, op, op);   /* on failure it stays gated: the safe side */
             }
         }
     }
-    else if (ntracked && is_tracked(tp)) {
-        (void)_Py_hashtable_steal(owned, op);
-    }
-    else if (is_generator_type(tp) && _Py_hashtable_len(lifted_gens)) {
-        (void)_Py_hashtable_steal(lifted_gens, op);
+    else if (owned_filter_maybe(op)) {     /* else in neither table: the common case */
+        /* Both, not either: a generator made in a lifted extent and returned by a FRESH leaf is in both tables. */
+        if (is_tracked(tp)) {
+            (void)_Py_hashtable_steal(owned, op);
+        }
+        if (is_generator_type(tp)) {
+            (void)_Py_hashtable_steal(lifted_gens, op);
+        }
     }
     return 0;
 }
@@ -701,6 +748,8 @@ owned_reset(void)
     }
     _Py_hashtable_clear(owned);
     _Py_hashtable_clear(lifted_gens);
+    memset(owned_filter, 0, sizeof(owned_filter));
+    owned_filter_adds = 0;
     ntracked = 0;
     if (track(&PyList_Type) < 0 || track(&PyDict_Type) < 0 || track(&PySet_Type) < 0
         || track(&PyByteArray_Type) < 0)
@@ -713,7 +762,74 @@ owned_reset(void)
 static int
 is_owned(PyObject *obj)
 {
-    return owned != NULL && _Py_hashtable_get(owned, obj) != NULL;
+    return owned != NULL && !owned_filter_force_miss && owned_filter_maybe(obj)
+           && _Py_hashtable_get(owned, obj) != NULL;
+}
+
+static int
+filter_set_entry(_Py_hashtable_t *ht, const void *key, const void *value, void *unused)
+{
+    owned_filter_add(key);
+    return 0;
+}
+
+static int
+filter_count_missing(_Py_hashtable_t *ht, const void *key, const void *value, void *missing)
+{
+    *(Py_ssize_t *)missing += !owned_filter_maybe(key);
+    return 0;
+}
+
+/* Recompute the filter from the tables, dropping the bits of addresses that have left both. It walks every bucket
+   (a _Py_hashtable never shrinks), so it is not run after every run, only once a quarter of the filter's bits have
+   been set since the last one (owned_filter_maybe_rebuild): its cost is then spread over at least that many adds. */
+static void
+owned_filter_rebuild(void)
+{
+    if (owned == NULL) {
+        return;
+    }
+    memset(owned_filter, 0, sizeof(owned_filter));
+    _Py_hashtable_foreach(owned, filter_set_entry, NULL);
+    _Py_hashtable_foreach(lifted_gens, filter_set_entry, NULL);
+    owned_filter_adds = 0;
+}
+
+static void
+owned_filter_maybe_rebuild(void)
+{
+    if (owned_filter_adds >= ((size_t)1 << OWNED_FILTER_LOG2) / 4) {
+        owned_filter_rebuild();
+    }
+}
+
+/* Test hooks (_restricted._owned_filter). "check": how many members of the two tables have a clear bit, which must
+   be 0. "rebuild": owned_filter_rebuild(). "miss"/"hit": lookups read every bit as clear, or stop doing so.
+   "owned"/"lifted_gens": that table's size. */
+Py_ssize_t
+_PyRestricted_OwnedFilter(const char *op)
+{
+    if (strcmp(op, "check") == 0) {
+        Py_ssize_t missing = 0;
+        if (owned != NULL) {
+            _Py_hashtable_foreach(owned, filter_count_missing, &missing);
+            _Py_hashtable_foreach(lifted_gens, filter_count_missing, &missing);
+        }
+        return missing;
+    }
+    if (strcmp(op, "owned") == 0 || strcmp(op, "lifted_gens") == 0) {
+        _Py_hashtable_t *ht = op[0] == 'o' ? owned : lifted_gens;
+        return ht == NULL ? 0 : (Py_ssize_t)_Py_hashtable_len(ht);
+    }
+    if (strcmp(op, "rebuild") == 0) {
+        owned_filter_rebuild();
+        return 0;
+    }
+    if (strcmp(op, "miss") == 0 || strcmp(op, "hit") == 0) {
+        owned_filter_force_miss = op[0] == 'm';
+        return 0;
+    }
+    return -1;
 }
 
 /* Called by _restricted.run() before a run: install the tracer, or forget every ownership if ours was replaced. */
@@ -754,7 +870,7 @@ mark_fresh(PyObject *callable, PyObject *result, PyObject *const *args, Py_ssize
         }
     }
     if (track(Py_TYPE(result)) == 0) {
-        (void)_Py_hashtable_set(owned, result, (void *)owned_epoch);
+        owned_add(result, owned_epoch);
     }
 }
 
@@ -1109,7 +1225,10 @@ static int undo_depth;              /* nesting of run(): only the outermost run 
 static uintptr_t
 owned_since(PyObject *obj)
 {
-    return owned == NULL ? 0 : (uintptr_t)_Py_hashtable_get(owned, obj);
+    if (owned == NULL || owned_filter_force_miss || !owned_filter_maybe(obj)) {
+        return 0;
+    }
+    return (uintptr_t)_Py_hashtable_get(owned, obj);
 }
 
 int
@@ -1234,6 +1353,7 @@ _PyRestricted_UndoEnd(int refused)
     Py_SETREF(undo, PyList_New(0));
     _Py_hashtable_clear(undo_seen);
     owned_epoch++;      /* what this run made is now older than the next run */
+    owned_filter_maybe_rebuild();
     if (undo == NULL) {
         PyErr_Clear();
         return -1;

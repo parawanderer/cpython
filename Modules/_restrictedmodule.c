@@ -254,6 +254,22 @@ restricted_owned(PyObject *module, PyObject *obj)
     return PyBool_FromLong(_PyRestricted_IsOwned(obj));
 }
 
+/* _owned_filter(op): test hooks for the filter in front of the owned set (Python/restricted.c). */
+static PyObject *
+restricted_owned_filter(PyObject *module, PyObject *op)
+{
+    const char *s = PyUnicode_AsUTF8(op);
+    if (s == NULL) {
+        return NULL;
+    }
+    Py_ssize_t r = _PyRestricted_OwnedFilter(s);
+    if (r < 0) {
+        PyErr_Format(PyExc_ValueError, "unknown _owned_filter op %R", op);
+        return NULL;
+    }
+    return PyLong_FromSsize_t(r);
+}
+
 /* memory(): the most heap the last run held at once, in bytes (RAW blocks and arenas). */
 static PyObject *
 restricted_memory(PyObject *module, PyObject *unused)
@@ -416,6 +432,8 @@ static PyMethodDef restricted_methods[] = {
      "write_barrier(obj, /)\n--\n\nLog obj's contents before a lifted leaf writes it."},
     {"owned", restricted_owned, METH_O,
      "owned(obj, /)\n--\n\nWhether obj is the cell's own."},
+    {"_owned_filter", restricted_owned_filter, METH_O,
+     "_owned_filter(op, /)\n--\n\nTest hooks for the filter in front of the owned set."},
     {"memory", restricted_memory, METH_NOARGS,
      "memory()\n--\n\nThe most heap the last run held at once, in bytes."},
     {"steps", restricted_steps, METH_NOARGS,

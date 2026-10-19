@@ -473,6 +473,11 @@ def give_back(x):
     return x
 
 
+def make_gen():
+    """A FRESH leaf returning a generator made in its lifted extent: the generator is in the owned set AND lifted_gens."""
+    return (i for i in range(2))
+
+
 class OwnershipTest(unittest.TestCase):
     """Slice 5: writes need a value the cell owns (made under the gate, or a FRESH leaf result), on every path: item
     writes, deletes, in-place operators, and a mutating method, which is not even read off a value the cell does not
@@ -590,6 +595,59 @@ class OwnershipTest(unittest.TestCase):
         xs = self.run_cell("return [1]")
         self.assertTrue(_restricted.owned(xs))
         self.assertFalse(_restricted.owned([1]))
+
+    def test_a_generator_in_both_tables_leaves_both(self):
+        _restricted.allow_call(make_gen, True)
+        _restricted.allow_fresh(make_gen)
+        sizes = lambda: (_restricted._owned_filter("owned"), _restricted._owned_filter("lifted_gens"))
+        ns = {"make_gen": make_gen}
+        self.run_cell("return 1", ns)           # the namespace's own entries exist before `before` is read
+        before = sizes()
+        self.run_cell("g = make_gen()", ns)
+        self.assertTrue(_restricted.owned(ns["g"]))
+        del ns["g"]
+        self.assertEqual(sizes(), before)       # a stale lifted_gens entry would resume a later generator lifted
+
+    # --- the filter in front of the owned set ---
+
+    def test_every_member_has_its_filter_bit(self):
+        ns = {}
+        self.run_cell("keep = []\nfor i in range(20000):\n    keep.append([i])\n    t = {i: i}\nreturn 1", ns)
+        self.assertEqual(_restricted._owned_filter("check"), 0)
+        del ns["keep"][::2]                      # freed outside any run
+        self.assertEqual(_restricted._owned_filter("check"), 0)
+        _restricted._owned_filter("rebuild")
+        self.assertEqual(_restricted._owned_filter("check"), 0)
+
+    def test_a_dense_filter_still_forgets_freed_addresses(self):
+        # 20000 owned lists set most of the filter's bits, then die outside a run: every deallocation must still
+        # leave the set, or a host list at a reused address reads as owned.
+        ns = {}
+        self.run_cell("keep = []\nfor i in range(20000):\n    keep.append([i])\nreturn 1", ns)
+        n = _restricted._owned_filter("owned")
+        del ns["keep"]
+        self.assertLessEqual(_restricted._owned_filter("owned"), n - 20000)
+        made = [[i] for i in range(20000)]
+        self.assertFalse(any(_restricted.owned(x) for x in made))
+
+    def test_a_filter_miss_refuses_the_write(self):
+        # The filter's failure in front of a lookup is "not owned" for a member: the write is refused, never let
+        # through. "miss" makes every lookup read a clear bit.
+        xs = self.run_cell("return [1]")
+        _restricted._owned_filter("miss")
+        try:
+            self.assertFalse(_restricted.owned(xs))
+            self.refused("xs.append(2)", xs=xs)
+            self.refused("xs[0] = 2", xs=xs)
+            self.refused("xs += [2]", xs=xs)
+        finally:
+            _restricted._owned_filter("hit")
+        self.assertEqual(xs, [1])
+        self.assertEqual(self.run_cell("xs.append(2)\nreturn xs", xs=xs), [1, 2])
+
+    def test_unknown_filter_op(self):
+        with self.assertRaises(ValueError):
+            _restricted._owned_filter("nope")
 
 
 class MemoryTest(unittest.TestCase):

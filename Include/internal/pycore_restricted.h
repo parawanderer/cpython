@@ -107,6 +107,8 @@ extern int _PyRestricted_IsLiftedGen(PyObject *gen);
 PyAPI_FUNC(int) _PyRestricted_IsOwned(PyObject *obj);
 extern int _PyRestricted_CheckInPlace(PyObject *v);
 PyAPI_FUNC(int) _PyRestricted_OwnedReady(void);
+/* Test hooks for the filter in front of the owned set: "check", "rebuild", "miss", "hit", "owned", "lifted_gens". */
+PyAPI_FUNC(Py_ssize_t) _PyRestricted_OwnedFilter(const char *op);
 
 /* Memory (slice 5): a byte cap per run, counted at the RAW and arena allocators. */
 PyAPI_FUNC(int) _PyRestricted_MemoryBegin(long long limit);
