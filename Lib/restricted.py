@@ -117,8 +117,19 @@ def check(source, nodes=DEFAULT_NODES):
     """The cell's statements, membership-checked and rewritten, as an ``ast`` list for the wrapper's body. Raises
     NotInDialect (or SyntaxError) before anything runs."""
     body = "def _user():\n" + textwrap.indent(source, "    ")
-    tree = ast.parse(body)
+    try:
+        tree = ast.parse(body)
+    except SyntaxError as e:
+        if e.lineno is not None:
+            e.lineno -= 1
+        if getattr(e, "end_lineno", None) is not None:
+            e.end_lineno -= 1
+        raise
     stmts = tree.body[0].body
+    # Parsed under the wrapper's ``def _user():`` line: every line is one past the cell's. Shift back, so a refusal at
+    # check time, a refusal at run time and a traceback all name the cell's own line.
+    for s in stmts:
+        ast.increment_lineno(s, -1)
     m = _Membership(frozenset(nodes))
     return [m.visit(s) for s in stmts]
 

@@ -100,6 +100,25 @@ class CompileTest(unittest.TestCase):
     def test_a_top_level_return_is_the_value(self):
         self.assertEqual(restricted.run_cell("return 6 * 7", {}), 42)
 
+    def test_lines_are_the_cells_own(self):
+        # The cell is parsed under the wrapper's `def _user():` line; every line it reports is the cell's, not one past.
+        with self.assertRaisesRegex(restricted.NotInDialect, r"While \(line 2\)$"):
+            restricted.check("x = 1\nwhile True:\n    pass")
+        with self.assertRaises(SyntaxError) as cm:
+            restricted.check("x = 1\nx = (")
+        self.assertEqual(cm.exception.lineno, 2)
+        try:
+            restricted.run_cell("x = 1\ny = 2\nimport os", {})
+        except restricted.NotInDialect as e:   # not assertRaises: it drops the traceback
+            tb, lines = e.__traceback__, []
+        else:
+            self.fail("import os was not refused")
+        while tb is not None:
+            if tb.tb_frame.f_code.co_filename == "<cell>":
+                lines.append(tb.tb_lineno)
+            tb = tb.tb_next
+        self.assertEqual(lines[-1:], [3], "the run-time refusal's frame is on the cell's line")
+
 
 def allow_probes():
     """What the extent tests call from restricted code: the probe (unlifted, or it would always read False), the
