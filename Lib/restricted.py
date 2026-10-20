@@ -11,7 +11,6 @@ refused outright. A refusal here is NotInDialect before anything runs.
 """
 
 import ast
-import textwrap
 import _restricted
 
 NotInDialect = _restricted.NotInDialect
@@ -116,20 +115,10 @@ class _Membership(ast.NodeTransformer):
 def check(source, nodes=DEFAULT_NODES):
     """The cell's statements, membership-checked and rewritten, as an ``ast`` list for the wrapper's body. Raises
     NotInDialect (or SyntaxError) before anything runs."""
-    body = "def _user():\n" + textwrap.indent(source, "    ")
-    try:
-        tree = ast.parse(body)
-    except SyntaxError as e:
-        if e.lineno is not None:
-            e.lineno -= 1
-        if getattr(e, "end_lineno", None) is not None:
-            e.end_lineno -= 1
-        raise
-    stmts = tree.body[0].body
-    # Parsed under the wrapper's ``def _user():`` line: every line is one past the cell's. Shift back, so a refusal at
-    # check time, a refusal at run time and a traceback all name the cell's own line.
-    for s in stmts:
-        ast.increment_lineno(s, -1)
+    # Parsed as the cell itself, not indented under ``def _user():``: a top-level ``return`` parses (only the compiler
+    # refuses it, and compile_cell puts the statements in ``_user``), so every line and column is the cell's own and a
+    # multi-line string keeps its text, where an indent would have added to its continuation lines.
+    stmts = ast.parse(source).body
     m = _Membership(frozenset(nodes))
     return [m.visit(s) for s in stmts]
 
