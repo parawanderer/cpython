@@ -263,6 +263,16 @@ restricted_table_sizes(PyObject *module, PyObject *unused)
     return Py_BuildValue("(nn)", a, b);
 }
 
+/* _memory_wrapped(): (whether MEM and OBJ are wrapped for this allocator, -1 before the first run; whether ours is on
+   top of MEM; of OBJ), for tests. */
+static PyObject *
+restricted_memory_wrapped(PyObject *module, PyObject *unused)
+{
+    int wraps, mem, obj;
+    _PyRestricted_MemoryWrapped(&wraps, &mem, &obj);
+    return Py_BuildValue("(iOO)", wraps, mem ? Py_True : Py_False, obj ? Py_True : Py_False);
+}
+
 /* memory(): the most heap the last run held at once, in bytes (RAW blocks and arenas). */
 static PyObject *
 restricted_memory(PyObject *module, PyObject *unused)
@@ -427,6 +437,8 @@ static PyMethodDef restricted_methods[] = {
      "owned(obj, /)\n--\n\nWhether obj is the cell's own."},
     {"_table_sizes", restricted_table_sizes, METH_NOARGS,
      "_table_sizes()\n--\n\nThe sizes of the owned set and of the lifted generators' table (tests)."},
+    {"_memory_wrapped", restricted_memory_wrapped, METH_NOARGS,
+     "_memory_wrapped()\n--\n\n(wraps MEM/OBJ, ours on top of MEM, of OBJ) (tests)."},
     {"memory", restricted_memory, METH_NOARGS,
      "memory()\n--\n\nThe most heap the last run held at once, in bytes."},
     {"steps", restricted_steps, METH_NOARGS,

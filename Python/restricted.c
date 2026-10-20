@@ -833,7 +833,7 @@ _PyRestricted_AllowFresh(PyObject *callable)
    wrapping those two counts the heap a run adds, net of what it frees, at almost no cost per small object. Without
    pymalloc (Emscripten and WASI build --without-pymalloc, so this is Pyodide's case; also PYTHONMALLOC=malloc or
    mimalloc) the MEM and OBJ domains call malloc directly and never reach RAW, so they are wrapped too, each block
-   counted. A request that would take the run past its cap FAILS before anything is allocated (so "a" * 10**11 is
+   counted, for the outermost run's extent only: outside a run they allocate with nothing in between. A request that would take the run past its cap FAILS before anything is allocated (so "a" * 10**11 is
    refused in microseconds instead of touching 100 GB), and trips the run, so the MemoryError the caller raises ends as
    NotInDialect however it is handled. The wrappers are installed once, as hooks that call the previous allocator (the
    documented way to hook after initialization), and count only on the running thread while a run is in progress.
@@ -1021,6 +1021,66 @@ pymalloc_underneath(void)
 #endif
 }
 
+/* Is `cur` our wrapper over `orig`? */
+static int
+mem_is_ours(const PyMemAllocatorEx *cur, PyMemAllocatorEx *orig)
+{
+    return cur->malloc == counted_malloc && cur->ctx == orig;
+}
+
+static int mem_wrap_domains;        /* decided once: does this allocator need MEM and OBJ wrapped (not pymalloc)? */
+static int mem_in_chain[2];         /* is our wrapper in the MEM / OBJ domain's chain, on top or under another hook? */
+
+static PyMemAllocatorEx *
+domain_orig(int i)
+{
+    return i == 0 ? &mem_orig : &obj_orig;
+}
+
+/* Wrap MEM and OBJ for the outermost run's extent, so that code outside a run allocates through the original allocator
+   with no call in between. Both domains need the GIL, so the swap cannot race another thread's allocation. */
+static void
+mem_domains_wrap(void)
+{
+    if (!mem_wrap_domains) {
+        return;
+    }
+    for (int i = 0; i < 2; i++) {
+        PyMemAllocatorDomain d = i == 0 ? PYMEM_DOMAIN_MEM : PYMEM_DOMAIN_OBJ;
+        if (mem_in_chain[i]) {
+            continue;                   /* still under a hook stacked over it during an earlier run: it counts there */
+        }
+        PyMem_GetAllocator(d, domain_orig(i));
+        PyMemAllocatorEx ours = {domain_orig(i), counted_malloc, counted_calloc, counted_realloc, counted_free};
+        PyMem_SetAllocator(d, &ours);
+        mem_in_chain[i] = 1;
+    }
+}
+
+/* Put the originals back, but only where ours is still on top. A hook stacked over ours during the run (tracemalloc
+   started by host code) keeps ours as its inner allocator; restoring past it would drop that hook, and its own restore
+   later would put ours back for good, to be wrapped again by the next run and count every block twice. So a buried
+   wrapper is left in place, a pass-through while no run is counting, and taken out by the first run that ends with
+   it back on top. */
+static void
+mem_domains_unwrap(void)
+{
+#ifdef Py_GIL_DISABLED
+    /* Without a GIL another thread can be inside MEM or OBJ while the allocator is swapped, so a free-threaded build
+       keeps the wrappers installed from the first run on, a pass-through outside a run. */
+    return;
+#endif
+    for (int i = 0; i < 2; i++) {
+        PyMemAllocatorDomain d = i == 0 ? PYMEM_DOMAIN_MEM : PYMEM_DOMAIN_OBJ;
+        PyMemAllocatorEx cur;
+        PyMem_GetAllocator(d, &cur);
+        if (mem_in_chain[i] && mem_is_ours(&cur, domain_orig(i))) {
+            PyMem_SetAllocator(d, domain_orig(i));
+            mem_in_chain[i] = 0;
+        }
+    }
+}
+
 static int
 mem_install(void)
 {
@@ -1029,7 +1089,7 @@ mem_install(void)
     }
     /* Only pymalloc routes MEM and OBJ through RAW and the arenas; wrapping them under it would count a block twice.
        Read before RAW is wrapped: after, the name matches no known allocator and reads as NULL. */
-    int wrap_domains = !pymalloc_underneath();
+    mem_wrap_domains = !pymalloc_underneath();
     PyMem_GetAllocator(PYMEM_DOMAIN_RAW, &raw_orig);
     PyObject_GetArenaAllocator(&arena_orig);
     _Py_hashtable_allocator_t a = {ht_malloc, ht_free};
@@ -1042,16 +1102,20 @@ mem_install(void)
     PyObjectArenaAllocator arena = {NULL, arena_alloc, arena_free};
     PyMem_SetAllocator(PYMEM_DOMAIN_RAW, &raw);
     PyObject_SetArenaAllocator(&arena);
-    if (wrap_domains) {
-        PyMem_GetAllocator(PYMEM_DOMAIN_MEM, &mem_orig);
-        PyMem_GetAllocator(PYMEM_DOMAIN_OBJ, &obj_orig);
-        PyMemAllocatorEx mem = {&mem_orig, counted_malloc, counted_calloc, counted_realloc, counted_free};
-        PyMemAllocatorEx obj = {&obj_orig, counted_malloc, counted_calloc, counted_realloc, counted_free};
-        PyMem_SetAllocator(PYMEM_DOMAIN_MEM, &mem);
-        PyMem_SetAllocator(PYMEM_DOMAIN_OBJ, &obj);
-    }
     mem_installed = 1;
     return 0;
+}
+
+/* Test hook: whether MEM and OBJ are wrapped for this allocator at all, and whether ours is on top of each now. */
+void
+_PyRestricted_MemoryWrapped(int *wraps, int *mem_on_top, int *obj_on_top)
+{
+    PyMemAllocatorEx cur;
+    *wraps = mem_installed ? mem_wrap_domains : -1;
+    PyMem_GetAllocator(PYMEM_DOMAIN_MEM, &cur);
+    *mem_on_top = mem_is_ours(&cur, &mem_orig);
+    PyMem_GetAllocator(PYMEM_DOMAIN_OBJ, &cur);
+    *obj_on_top = mem_is_ours(&cur, &obj_orig);
 }
 
 /* Start counting for a run on this thread, capped at `limit` bytes. Returns 1 when this call started the count (the
@@ -1070,6 +1134,7 @@ _PyRestricted_MemoryBegin(long long limit)
     mem_limit = limit;
     mem_tripped = 0;
     mem_thread = PyThread_get_thread_ident();
+    mem_domains_wrap();
     mem_counting = 1;
     return 1;
 }
@@ -1079,6 +1144,7 @@ int
 _PyRestricted_MemoryEnd(long long *peak)
 {
     mem_counting = 0;
+    mem_domains_unwrap();
     _Py_hashtable_clear(mem_blocks);
     *peak = mem_peak;
     return mem_tripped;

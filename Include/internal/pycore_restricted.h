@@ -125,6 +125,8 @@ PyAPI_FUNC(void) _PyRestricted_TableSizes(Py_ssize_t *n_owned, Py_ssize_t *n_lif
 /* Memory (slice 5): a byte cap per run, counted at the RAW and arena allocators. */
 PyAPI_FUNC(int) _PyRestricted_MemoryBegin(long long limit);
 PyAPI_FUNC(int) _PyRestricted_MemoryEnd(long long *peak);
+/* Test hook: are MEM and OBJ wrapped for this allocator (-1 before the first run), and is ours on top of each. */
+PyAPI_FUNC(void) _PyRestricted_MemoryWrapped(int *wraps, int *mem_on_top, int *obj_on_top);
 /* Is a sequence repeat's size within the cap? -1 when it is not (the run is tripped). Objects/abstract.c. */
 extern int _PyRestricted_RepeatAdmit(PyObject *seq, PyObject *n);
 

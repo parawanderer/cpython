@@ -6,6 +6,7 @@ tests/fixtures/dialect-vectors/) are the acceptance suite once the gate exists.
 """
 
 import gc
+import sysconfig
 import types
 import unittest
 
@@ -881,11 +882,58 @@ class MemoryTest(unittest.TestCase):
             self.refused(src)
 
     def test_a_block_is_counted_once(self):
-        # An 8 MB item array is one block, counted at OBJ/MEM or at RAW, never both. Under pymalloc MEM and OBJ reach
-        # RAW and the arenas, so wrapping them too counted it twice (2.00x before the fix).
+        # An 8 MB item array is one block: counted at OBJ/MEM or at RAW, never both. Under pymalloc MEM and OBJ are
+        # not wrapped at all (they reach RAW and the arenas), whatever the allocator name reads once RAW is wrapped.
         self.assertEqual(self.run_cell("x = [0] * 10 ** 6\nreturn len(x)"), 10 ** 6)
         self.assertGreaterEqual(_restricted.memory(), 8 * 10 ** 6)
         self.assertLess(_restricted.memory(), 9 * 10 ** 6)
+        # The allocator this interpreter started with, not the environment (-E ignores PYTHONMALLOC): NOT_SET, DEFAULT,
+        # DEBUG and the two pymalloc ones put pymalloc under MEM and OBJ.
+        import _testinternalcapi
+        pymalloc = _testinternalcapi.get_configs()["pre_config"]["allocator"] in (0, 1, 2, 5, 6)
+        if pymalloc:
+            self.assertEqual(_restricted._memory_wrapped()[0], 0, "pymalloc routes MEM and OBJ through RAW and the arenas")
+        else:
+            self.assertEqual(_restricted._memory_wrapped()[0], 1)
+
+    def test_mem_and_obj_are_wrapped_only_inside_a_run(self):
+        seen = []
+        def probe():
+            seen.append(_restricted._memory_wrapped())
+            return 0
+        _restricted.allow_call(probe, True)
+        self.run_cell("return probe()", probe=probe)
+        wraps, mem, obj = seen[0]
+        self.assertEqual((mem, obj), (bool(wraps), bool(wraps)), "inside the run")
+        # A free-threaded build keeps them installed: swapping them without a GIL would race another thread's allocation.
+        after = (bool(wraps), bool(wraps)) if sysconfig.get_config_var("Py_GIL_DISABLED") else (False, False)
+        self.assertEqual(_restricted._memory_wrapped()[1:], after, "after it")
+
+    def test_a_hook_stacked_during_a_run_is_kept_and_nothing_is_counted_twice(self):
+        import tracemalloc
+        if tracemalloc.is_tracing():
+            # Its stop() would put back the allocators saved at startup, from before ours, and every later test here
+            # would count nothing.
+            self.skipTest("tracemalloc was started before the first run")
+        def start():
+            tracemalloc.start()
+            return 0
+        _restricted.allow_call(start, True)
+        try:
+            self.run_cell("return start()", start=start)
+            self.assertTrue(tracemalloc.is_tracing(), "the run's end did not drop the hook stacked over ours")
+            before = tracemalloc.get_traced_memory()[0]
+            x = [0] * 10 ** 5
+            self.assertGreater(tracemalloc.get_traced_memory()[0], before, "and it still sees allocations")
+            del x
+        finally:
+            tracemalloc.stop()
+        for _ in range(2):      # the first run takes out the wrapper tracemalloc put back; the second wraps afresh
+            self.assertEqual(self.run_cell("x = [0] * 10 ** 6\nreturn len(x)"), 10 ** 6)
+            self.assertLess(_restricted.memory(), 9 * 10 ** 6, "counted once")
+            wraps = bool(_restricted._memory_wrapped()[0])
+            gil_free = sysconfig.get_config_var("Py_GIL_DISABLED")
+            self.assertEqual(_restricted._memory_wrapped()[1:], (wraps, wraps) if gil_free else (False, False))
 
     def test_an_empty_or_negative_repeat_is_not_judged(self):
         # Neither asks for memory, so each keeps CPython's own error: past Py_ssize_t is an OverflowError either way.
