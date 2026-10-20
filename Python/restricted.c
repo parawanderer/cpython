@@ -978,6 +978,10 @@ mem_install(void)
     if (mem_installed) {
         return 0;
     }
+    /* Only pymalloc routes MEM and OBJ through RAW and the arenas; wrapping them under it would count a block twice.
+       The name is read before RAW is wrapped: after, it matches no known allocator and reads as NULL. */
+    const char *name = _PyMem_GetCurrentAllocatorName();
+    int wrap_domains = name == NULL || (strcmp(name, "pymalloc") != 0 && strcmp(name, "pymalloc_debug") != 0);
     PyMem_GetAllocator(PYMEM_DOMAIN_RAW, &raw_orig);
     PyObject_GetArenaAllocator(&arena_orig);
     _Py_hashtable_allocator_t a = {ht_malloc, ht_free};
@@ -990,9 +994,7 @@ mem_install(void)
     PyObjectArenaAllocator arena = {NULL, arena_alloc, arena_free};
     PyMem_SetAllocator(PYMEM_DOMAIN_RAW, &raw);
     PyObject_SetArenaAllocator(&arena);
-    /* Only pymalloc routes MEM and OBJ through RAW and the arenas; wrapping them under it would count a block twice. */
-    const char *name = _PyMem_GetCurrentAllocatorName();
-    if (name == NULL || (strcmp(name, "pymalloc") != 0 && strcmp(name, "pymalloc_debug") != 0)) {
+    if (wrap_domains) {
         PyMem_GetAllocator(PYMEM_DOMAIN_MEM, &mem_orig);
         PyMem_GetAllocator(PYMEM_DOMAIN_OBJ, &obj_orig);
         PyMemAllocatorEx mem = {&mem_orig, counted_malloc, counted_calloc, counted_realloc, counted_free};
