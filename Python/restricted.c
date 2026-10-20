@@ -972,6 +972,34 @@ arena_free(void *ctx, void *ptr, size_t size)
     arena_orig.free(arena_orig.ctx, ptr, size);
 }
 
+/* Whether pymalloc sits under MEM and OBJ. The name is read first; a hook installed before ours (tracemalloc) hides
+   it, and then the allocator chosen at startup (PYTHONMALLOC, -X dev, an embedder's PyPreConfig) decides. */
+static int
+pymalloc_underneath(void)
+{
+    const char *name = _PyMem_GetCurrentAllocatorName();
+    if (name != NULL) {
+        return strcmp(name, "pymalloc") == 0 || strcmp(name, "pymalloc_debug") == 0;
+    }
+#if defined(WITH_PYMALLOC) && !defined(Py_GIL_DISABLED)
+    switch (_PyRuntime.preconfig.allocator) {
+    case PYMEM_ALLOCATOR_NOT_SET:
+    case PYMEM_ALLOCATOR_DEFAULT:
+    case PYMEM_ALLOCATOR_DEBUG:
+    case PYMEM_ALLOCATOR_PYMALLOC:
+    case PYMEM_ALLOCATOR_PYMALLOC_DEBUG:
+        return 1;
+    default:
+        return 0;
+    }
+#elif defined(WITH_PYMALLOC)
+    PyMemAllocatorName a = _PyRuntime.preconfig.allocator;
+    return a == PYMEM_ALLOCATOR_PYMALLOC || a == PYMEM_ALLOCATOR_PYMALLOC_DEBUG;
+#else
+    return 0;
+#endif
+}
+
 static int
 mem_install(void)
 {
@@ -979,9 +1007,8 @@ mem_install(void)
         return 0;
     }
     /* Only pymalloc routes MEM and OBJ through RAW and the arenas; wrapping them under it would count a block twice.
-       The name is read before RAW is wrapped: after, it matches no known allocator and reads as NULL. */
-    const char *name = _PyMem_GetCurrentAllocatorName();
-    int wrap_domains = name == NULL || (strcmp(name, "pymalloc") != 0 && strcmp(name, "pymalloc_debug") != 0);
+       Read before RAW is wrapped: after, the name matches no known allocator and reads as NULL. */
+    int wrap_domains = !pymalloc_underneath();
     PyMem_GetAllocator(PYMEM_DOMAIN_RAW, &raw_orig);
     PyObject_GetArenaAllocator(&arena_orig);
     _Py_hashtable_allocator_t a = {ht_malloc, ht_free};
