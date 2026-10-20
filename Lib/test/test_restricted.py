@@ -797,16 +797,27 @@ class MallocMemoryTest(unittest.TestCase):
     """The cap without pymalloc: Emscripten (Pyodide) and WASI build --without-pymalloc, where the MEM and OBJ domains
     call malloc and never reach RAW or the arenas. PYTHONMALLOC=malloc is the same wiring on this build."""
 
-    def test_memory_test_passes_under_malloc(self):
+    def run_memory_test(self, check, *args, **env):
         from test.support.script_helper import assert_python_ok
-        code = ("import sys, unittest, _testinternalcapi\n"
-                "assert _testinternalcapi.pymem_getallocatorsname() == 'malloc', _testinternalcapi.pymem_getallocatorsname()\n"
+        code = ("import sys, unittest, _testinternalcapi, tracemalloc\n"
+                f"{check}\n"
                 "from test.test_restricted import MemoryTest\n"
                 "r = unittest.TextTestRunner(stream=sys.stdout, verbosity=2).run("
                 "unittest.defaultTestLoader.loadTestsFromTestCase(MemoryTest))\n"
                 "sys.exit(not r.wasSuccessful())\n")
-        rc, out, err = assert_python_ok("-c", code, PYTHONMALLOC="malloc", __isolated=False)
+        assert_python_ok(*args, "-c", code, __isolated=False, **env)
 
+    def test_memory_test_passes_under_malloc(self):
+        self.run_memory_test("assert _testinternalcapi.pymem_getallocatorsname() == 'malloc', "
+                             "_testinternalcapi.pymem_getallocatorsname()", PYTHONMALLOC="malloc")
+
+    def test_memory_test_passes_under_tracemalloc(self):
+        # tracemalloc hooks every domain at startup, so the allocator's name reads NULL; the startup choice decides
+        # whether MEM and OBJ are wrapped. Before, NULL meant "wrap", and pymalloc counted each block twice.
+        self.run_memory_test("assert tracemalloc.is_tracing()", "-X", "tracemalloc")
+
+    def test_memory_test_passes_under_malloc_and_tracemalloc(self):
+        self.run_memory_test("assert tracemalloc.is_tracing()", "-X", "tracemalloc", PYTHONMALLOC="malloc")
 
 class Frame:
     """A stand-in for a pandas object: Python dunders that read internals the gate would refuse, and a __getitem__
