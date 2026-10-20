@@ -529,6 +529,27 @@ _PyRestricted_ReadAttrLifted(PyObject *obj, PyObject *name, PyObject **result)
     return *result == NULL ? -1 : 0;
 }
 
+/* A CO_RESTRICTED frame entered while no run is active: the cell's own function, called by host code after its run
+   (a later approved cell, exec() of its code, a C library handed it as a callback). Refused rather than run, so code
+   the gate never saw runs nowhere outside it; the text tells the caller what to do instead. */
+int
+_PyRestricted_RefuseOutside(struct _PyInterpreterFrame *frame)
+{
+    PyObject *exc = not_in_dialect ? not_in_dialect : PyExc_PermissionError;
+    /* Named as the cell wrote it: without the wrapper's "_user.<locals>." (restricted.compile_cell). */
+    PyObject *name = _PyFrame_GetCode(frame)->co_qualname, *shown = NULL;
+    PyObject *prefix = PyUnicode_FromString("_user.<locals>.");
+    if (prefix != NULL && PyUnicode_Tailmatch(name, prefix, 0, PY_SSIZE_T_MAX, -1) > 0) {
+        shown = PyUnicode_Substring(name, PyUnicode_GET_LENGTH(prefix), PyUnicode_GET_LENGTH(name));
+    }
+    Py_XDECREF(prefix);
+    PyErr_Clear();   /* a failure above only loses the shorter name */
+    PyErr_Format(exc, "not in dialect: %U() was defined in a cell that ran inside the read-only dialect, unasked, "
+                 "and runs only there; define it again in this cell to call it here", shown ? shown : name);
+    Py_XDECREF(shown);
+    return -1;
+}
+
 void
 _PyRestricted_SetException(PyObject *exc)
 {

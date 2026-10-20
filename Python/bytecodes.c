@@ -172,9 +172,18 @@ dummy_func(
             }
         }
 
+        /* window.ml restricted mode: a CO_RESTRICTED frame is entered only inside a run (pycore_restricted.h). */
+        tier1 op(_RESTRICTED_ENTRY, (--)) {
+            if ((_PyFrame_GetCode(frame)->co_flags & CO_RESTRICTED) && !_PyRestricted_InRun(tstate)) {
+                int err = _PyRestricted_RefuseOutside(frame);
+                ERROR_IF(err);
+            }
+        }
+
         op(_QUICKEN_RESUME, (--)) {
             #if ENABLE_SPECIALIZATION_FT
-            if (tstate->tracing == 0 && this_instr->op.code == RESUME) {
+            if (tstate->tracing == 0 && this_instr->op.code == RESUME
+                && !(_PyFrame_GetCode(frame)->co_flags & CO_RESTRICTED)) {
                 FT_ATOMIC_STORE_UINT8_RELAXED(this_instr->op.code, RESUME_CHECK);
             }
             #endif  /* ENABLE_SPECIALIZATION_FT */
@@ -224,6 +233,7 @@ dummy_func(
         macro(RESUME) =
             _LOAD_BYTECODE +
             _MAYBE_INSTRUMENT +
+            _RESTRICTED_ENTRY +
             _QUICKEN_RESUME +
             _CHECK_PERIODIC_IF_NOT_YIELD_FROM;
 
@@ -236,6 +246,7 @@ dummy_func(
             uintptr_t version = FT_ATOMIC_LOAD_UINTPTR_ACQUIRE(_PyFrame_GetCode(frame)->_co_instrumentation_version);
             assert((version & _PY_EVAL_EVENTS_MASK) == 0);
             DEOPT_IF(eval_breaker != version);
+            DEOPT_IF(_PyFrame_GetCode(frame)->co_flags & CO_RESTRICTED);
             #ifdef Py_GIL_DISABLED
             DEOPT_IF(frame->tlbc_index !=
                      ((_PyThreadStateImpl *)tstate)->tlbc_index);
@@ -255,6 +266,7 @@ dummy_func(
         macro(INSTRUMENTED_RESUME) =
             _LOAD_BYTECODE +
             _MAYBE_INSTRUMENT +
+            _RESTRICTED_ENTRY +
             _CHECK_PERIODIC_IF_NOT_YIELD_FROM +
             _MONITOR_RESUME;
 

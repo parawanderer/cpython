@@ -6,6 +6,7 @@ tests/fixtures/dialect-vectors/) are the acceptance suite once the gate exists.
 """
 
 import gc
+import types
 import unittest
 
 import _restricted
@@ -177,16 +178,94 @@ class ExtentTest(unittest.TestCase):
             restricted.run_cell("return lift(lambda: 1 / 0)", self.ns())
         self.assertFalse(_restricted.active())
 
-    def test_a_restricted_def_called_from_outside_any_entry_runs_unrestricted(self):
-        # Ruled 2026-10-15: restriction is a property of the ENTRY; the bare caller already holds full capability.
+    def test_a_restricted_def_called_from_outside_any_entry_is_refused(self):
+        # Ruled 2026-10-20 (window-ml PYTHON_DIALECT.md, #895), replacing 2026-10-15's "restriction is a property of the
+        # ENTRY": a cell's own function runs only inside a run, never ungated outside one. OutsideRunTest has each route.
         ns = self.ns()
-        restricted.run_cell("def probe():\n    return active()\nreturn probe()", ns)
-        self.assertFalse(ns["probe"]())
+        self.assertTrue(restricted.run_cell("def probe():\n    return active()\nreturn probe()", ns))
+        with self.assertRaisesRegex(restricted.NotInDialect, r"^not in dialect: probe\(\) was defined in a cell"):
+            ns["probe"]()
 
     def test_runs_nest(self):
         ns = self.ns()
         ns["inner"] = lambda: restricted.run_cell("return active()", self.ns())
         self.assertEqual(restricted.run_cell("return [lift(inner), active()]", ns), [True, True])
+
+
+
+class OutsideRunTest(unittest.TestCase):
+    """A CO_RESTRICTED frame entered while no run is active is refused (#895), on every route into it: the check is at
+    RESUME, which a call, a generator's or coroutine's resumption and exec() of the code all pass through."""
+
+    WHY = r"^not in dialect: %s\(\) was defined in a cell that ran inside the read-only dialect, unasked, and runs only there; define it again in this cell to call it here$"
+
+    def setUp(self):
+        _restricted.allow_call(next, False)
+        _restricted.allow_call(list, False)
+
+    def tearDown(self):
+        _restricted.reset()
+
+    def cell(self, src):
+        ns = {}
+        restricted.run_cell(src, ns)
+        return ns
+
+    def test_a_direct_call(self):
+        ns = self.cell("def f(x):\n    return x + 1")
+        self.assertEqual(restricted.run_cell("return f(1)", ns), 2, "inside a run it runs")
+        with self.assertRaisesRegex(restricted.NotInDialect, self.WHY % "f"):
+            ns["f"](1)
+
+    def test_a_lambda_is_named_as_the_cell_wrote_it(self):
+        ns = self.cell("g = lambda: open")
+        with self.assertRaisesRegex(restricted.NotInDialect, self.WHY % "<lambda>"):
+            ns["g"]()
+
+    def test_a_nested_function_it_returns(self):
+        ns = self.cell("def outer():\n    return lambda: 1\nh = outer()")
+        with self.assertRaisesRegex(restricted.NotInDialect, self.WHY % r"outer\.<locals>\.<lambda>"):
+            ns["h"]()
+
+    def test_exec_of_its_code(self):
+        ns = self.cell("g = lambda: open")
+        with self.assertRaises(restricted.NotInDialect):
+            exec(ns["g"].__code__, {})
+        with self.assertRaises(restricted.NotInDialect):
+            exec(restricted.compile_cell("return 1"), {})
+
+    def test_a_c_library_calling_it_from_host_code(self):
+        ns = self.cell("f = lambda x: x")
+        for call in (lambda: list(map(ns["f"], [1])), lambda: sorted([2, 1], key=ns["f"])):
+            with self.assertRaises(restricted.NotInDialect):
+                call()
+
+    def test_a_generator_started_and_resumed_outside(self):
+        code = restricted.mark(compile("def gen():\n    yield 1\n    yield 2", "<cell>", "exec"))
+        gen = types.FunctionType([c for c in code.co_consts if isinstance(c, types.CodeType)][0], {})
+        with self.assertRaises(restricted.NotInDialect):
+            next(gen())
+        # Started inside a run, resumed outside it: the resumption is refused too.
+        ns = {"gen": gen}
+        restricted.run_cell("it = gen()\nfirst = next(it)", ns)
+        self.assertEqual(ns["first"], 1)
+        with self.assertRaises(restricted.NotInDialect):
+            next(ns["it"])
+
+    def test_a_coroutine(self):
+        code = restricted.mark(compile("async def co():\n    return 3", "<cell>", "exec"))
+        co = types.FunctionType([c for c in code.co_consts if isinstance(c, types.CodeType)][0], {})
+        c = co()
+        with self.assertRaises(restricted.NotInDialect):
+            c.send(None)
+
+    def test_host_code_is_untouched(self):
+        # Positive control: unmarked code runs as ever, and a run's state is restored around the refusal.
+        ns = self.cell("f = lambda: 1")
+        with self.assertRaises(restricted.NotInDialect):
+            ns["f"]()
+        self.assertEqual(list(map(lambda x: x + 1, [1])), [2])
+        self.assertFalse(_restricted.active())
 
 
 def peek(o):
@@ -419,7 +498,9 @@ class BudgetTest(unittest.TestCase):
     def test_the_budget_ends_with_the_run(self):
         f = self.run_cell("def f(n):\n    t = 0\n    for i in range(n):\n        t += i\n    return t\nreturn f",
                           budget=100)
-        self.assertEqual(f(1000), 499500, "a restricted def called outside a run is neither gated nor metered")
+        # Its run's budget does not follow it out: outside a run it is refused, never metered on a spent budget (#895).
+        with self.assertRaisesRegex(restricted.NotInDialect, r"^not in dialect: f\(\) was defined in a cell"):
+            f(1000)
         self.refused(self.LOOP, "step budget", budget=50)
         self.assertEqual(self.run_cell(self.LOOP, budget=500), 4950, "an exhausted budget does not leak to the next")
 
