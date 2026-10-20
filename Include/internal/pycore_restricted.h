@@ -42,6 +42,18 @@ _PyRestricted_Active(PyThreadState *tstate)
     return 0;
 }
 
+/* Is a run active on this thread (restricted, or lifted inside one)? A CO_RESTRICTED frame may be entered only then
+   (PYTHON_DIALECT.md, #895): the cell's own code runs only inside a run, never ungated and never gated outside one.
+   Checked at RESUME, so a call, a generator's or coroutine's resumption and exec() of its code all pass through it. */
+static inline int
+_PyRestricted_InRun(PyThreadState *tstate)
+{
+    _PyThreadStateImpl *ts = (_PyThreadStateImpl *)tstate;
+    return ts->restricted || ts->restricted_lifted;
+}
+/* Refuse entering `frame`'s CO_RESTRICTED code outside a run: -1 with NotInDialect set, naming the function. */
+extern int _PyRestricted_RefuseOutside(struct _PyInterpreterFrame *frame);
+
 /* Lift the gate for the C extent of an approved call (save, then restore on every exit). A CO_RESTRICTED frame
    reached inside it is gated again by _PyRestricted_Active(). */
 typedef struct {

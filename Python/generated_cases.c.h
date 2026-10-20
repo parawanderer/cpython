@@ -7531,6 +7531,17 @@
                     }
                 }
             }
+            // _RESTRICTED_ENTRY
+            {
+                if ((_PyFrame_GetCode(frame)->co_flags & CO_RESTRICTED) && !_PyRestricted_InRun(tstate)) {
+                    _PyFrame_SetStackPointer(frame, stack_pointer);
+                    int err = _PyRestricted_RefuseOutside(frame);
+                    stack_pointer = _PyFrame_GetStackPointer(frame);
+                    if (err) {
+                        JUMP_TO_LABEL(error);
+                    }
+                }
+            }
             // _CHECK_PERIODIC_IF_NOT_YIELD_FROM
             {
                 if ((oparg & RESUME_OPARG_LOCATION_MASK) < RESUME_AFTER_YIELD_FROM) {
@@ -10513,10 +10524,22 @@
                     }
                 }
             }
+            // _RESTRICTED_ENTRY
+            {
+                if ((_PyFrame_GetCode(frame)->co_flags & CO_RESTRICTED) && !_PyRestricted_InRun(tstate)) {
+                    _PyFrame_SetStackPointer(frame, stack_pointer);
+                    int err = _PyRestricted_RefuseOutside(frame);
+                    stack_pointer = _PyFrame_GetStackPointer(frame);
+                    if (err) {
+                        JUMP_TO_LABEL(error);
+                    }
+                }
+            }
             // _QUICKEN_RESUME
             {
                 #if ENABLE_SPECIALIZATION_FT
-                if (tstate->tracing == 0 && this_instr->op.code == RESUME) {
+                if (tstate->tracing == 0 && this_instr->op.code == RESUME
+                    && !(_PyFrame_GetCode(frame)->co_flags & CO_RESTRICTED)) {
                     FT_ATOMIC_STORE_UINT8_RELAXED(this_instr->op.code, RESUME_CHECK);
                 }
                 #endif  /* ENABLE_SPECIALIZATION_FT */
@@ -10562,6 +10585,11 @@
             uintptr_t version = FT_ATOMIC_LOAD_UINTPTR_ACQUIRE(_PyFrame_GetCode(frame)->_co_instrumentation_version);
             assert((version & _PY_EVAL_EVENTS_MASK) == 0);
             if (eval_breaker != version) {
+                UPDATE_MISS_STATS(RESUME);
+                assert(_PyOpcode_Deopt[opcode] == (RESUME));
+                JUMP_TO_PREDICTED(RESUME);
+            }
+            if (_PyFrame_GetCode(frame)->co_flags & CO_RESTRICTED) {
                 UPDATE_MISS_STATS(RESUME);
                 assert(_PyOpcode_Deopt[opcode] == (RESUME));
                 JUMP_TO_PREDICTED(RESUME);
