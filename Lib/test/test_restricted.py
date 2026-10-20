@@ -776,6 +776,13 @@ class MemoryTest(unittest.TestCase):
                     'return len(10 ** 20 * "a")'):
             self.refused(src)
 
+    def test_a_block_is_counted_once(self):
+        # An 8 MB item array is one block, counted at OBJ/MEM or at RAW, never both. Under pymalloc MEM and OBJ reach
+        # RAW and the arenas, so wrapping them too counted it twice (2.00x before the fix).
+        self.assertEqual(self.run_cell("x = [0] * 10 ** 6\nreturn len(x)"), 10 ** 6)
+        self.assertGreaterEqual(_restricted.memory(), 8 * 10 ** 6)
+        self.assertLess(_restricted.memory(), 9 * 10 ** 6)
+
     def test_an_empty_or_negative_repeat_is_not_judged(self):
         # Neither asks for memory, so each keeps CPython's own error: past Py_ssize_t is an OverflowError either way.
         self.assertEqual(self.run_cell('return len("a" * -10 ** 6)'), 0)
