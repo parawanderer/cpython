@@ -107,7 +107,11 @@ class CompileTest(unittest.TestCase):
             restricted.check("x = 1\nwhile True:\n    pass")
         with self.assertRaises(SyntaxError) as cm:
             restricted.check("x = 1\nx = (")
-        self.assertEqual(cm.exception.lineno, 2)
+        self.assertEqual((cm.exception.lineno, cm.exception.offset, cm.exception.text), (2, 5, "x = (\n"))
+        # Columns too: a node, and so a traceback's caret, sits where the cell wrote it.
+        self.assertEqual([(s.lineno, s.col_offset) for s in restricted.check("x = 1\nif x:\n    y = 2")[1].body], [(3, 4)])
+        # A multi-line string keeps its text: nothing is indented into its continuation lines.
+        self.assertEqual(restricted.run_cell('s = """a\nb"""\nreturn s', {}), "a\nb")
         try:
             restricted.run_cell("x = 1\ny = 2\nimport os", {})
         except restricted.NotInDialect as e:   # not assertRaises: it drops the traceback
