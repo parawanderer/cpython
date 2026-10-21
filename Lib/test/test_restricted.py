@@ -998,7 +998,9 @@ class MemoryTest(unittest.TestCase):
         self.assertLess(_restricted.memory(), 9 * 10 ** 6, "counted once after it")
 
     def test_a_domain_that_counts_each_block_twice_refuses(self):
-        # No Python-level hook can build this chain: a second copy of our wrapper, stacked from C.
+        # No Python-level hook can build this chain: a second copy of our wrapper, stacked from C. A run first, so ours
+        # is already installed under the copy; else the run below installs ours over it and the unstack finds it buried.
+        self.assertEqual(self.run_cell("return 7"), 7)
         _restricted._memory_stack_ours(True)
         try:
             with self.assertRaisesRegex(_restricted.NotInDialect, r"RAW allocator counts each block 2 times"):
