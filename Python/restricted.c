@@ -846,6 +846,13 @@ _PyRestricted_AllowFresh(PyObject *callable)
    leaf's cost and size are its manifest's (tier 1 bounds over shape), not this cap's. */
 
 static PyMemAllocatorEx raw_orig, mem_orig, obj_orig;     /* each wrapper's ctx is the domain's previous allocator */
+static int mem_probing;                     /* an entry's probe is in progress (mem_verify) */
+static unsigned long mem_probe_thread;
+static int mem_probe_hits;                  /* how many of our wrappers the probe's allocation passed through */
+/* The probe's size, and how much a hook between two of ours may add to it (a debug hook's header): no table resize
+   or trace entry a stacked hook allocates for itself falls in this window, so only the probe's own block counts. */
+#define MEM_PROBE_N 3001
+#define MEM_PROBE_SLACK 256
 static PyObjectArenaAllocator arena_orig;
 static int mem_installed;
 static int mem_counting;
@@ -854,8 +861,11 @@ static long long mem_live, mem_peak, mem_limit;
 static int mem_tripped;
 static _Py_hashtable_t *mem_blocks;         /* block -> size, for the blocks a run allocated through a wrapped domain */
 
-static void *ht_malloc(size_t n) { return raw_orig.malloc(raw_orig.ctx, n); }
-static void ht_free(void *p) { raw_orig.free(raw_orig.ctx, p); }
+/* The block table is the cap's own bookkeeping and allocates from the C library, under every domain: through RAW it
+   would reach whatever hook sits there, and a hook that later chains back to our wrapper (tracemalloc restarted over
+   it) would record the table's own entries, without end. */
+static void *ht_malloc(size_t n) { return malloc(n); }
+static void ht_free(void *p) { free(p); }
 
 static inline int
 mem_mine(void)
@@ -906,6 +916,10 @@ static void *
 counted_malloc(void *ctx, size_t n)
 {
     PyMemAllocatorEx *o = ctx;
+    if (mem_probing && n >= MEM_PROBE_N && n <= MEM_PROBE_N + MEM_PROBE_SLACK
+        && PyThread_get_thread_ident() == mem_probe_thread) {
+        mem_probe_hits++;
+    }
     if (!mem_mine()) {
         return o->malloc(o->ctx, n);
     }
@@ -1106,6 +1120,85 @@ mem_install(void)
     return 0;
 }
 
+/* How many of our wrappers one allocation through domain `d`'s public API passes: 1 when ours is in its chain
+   (on top, or under a hook stacked over it during an earlier run), 0 when something dropped it, 2 or more when a block
+   would be counted twice. */
+static int
+mem_probe(PyMemAllocatorDomain d)
+{
+    mem_probe_thread = PyThread_get_thread_ident();
+    mem_probe_hits = 0;
+    mem_probing = 1;
+    void *p = d == PYMEM_DOMAIN_RAW ? PyMem_RawMalloc(MEM_PROBE_N)
+              : d == PYMEM_DOMAIN_MEM ? PyMem_Malloc(MEM_PROBE_N) : PyObject_Malloc(MEM_PROBE_N);
+    mem_probing = 0;
+    if (p == NULL) {
+        return -1;
+    }
+    if (d == PYMEM_DOMAIN_RAW) {
+        PyMem_RawFree(p);
+    }
+    else if (d == PYMEM_DOMAIN_MEM) {
+        PyMem_Free(p);
+    }
+    else {
+        PyObject_Free(p);
+    }
+    return mem_probe_hits;
+}
+
+/* At every outermost entry: is the cap's hook in the chain of every domain the run allocates through? A hook from
+   Python code can take it out: tracemalloc.stop() puts back the allocators its start() saw, from before ours, and then
+   a run counts nothing (a 2**26-item list was admitted with memory() == 0). Each domain is probed; one that lost ours
+   gets it back on top of whatever is there now, and one still not counting exactly once refuses the run. The arena
+   allocator (pymalloc's, which nothing in CPython hooks) is checked by its pointer, since probing it would take an
+   arena. Returns 0, or -1 with NotInDialect set. */
+static int
+mem_verify(void)
+{
+    PyObjectArenaAllocator cur_arena;
+    PyObject_GetArenaAllocator(&cur_arena);
+#ifndef Py_GIL_DISABLED
+    if (cur_arena.alloc != arena_alloc) {
+        arena_orig = cur_arena;
+        PyObjectArenaAllocator arena = {NULL, arena_alloc, arena_free};
+        PyObject_SetArenaAllocator(&arena);
+    }
+#endif
+    for (int i = 0; i < 3; i++) {
+        PyMemAllocatorDomain d = i == 0 ? PYMEM_DOMAIN_RAW : i == 1 ? PYMEM_DOMAIN_MEM : PYMEM_DOMAIN_OBJ;
+        if (i > 0 && !mem_wrap_domains) {
+            break;                      /* under pymalloc MEM and OBJ reach RAW and the arenas: not wrapped */
+        }
+        int hits = mem_probe(d);
+        /* Without a GIL another thread can be inside the domain while it is swapped: there a lost hook refuses. */
+#ifndef Py_GIL_DISABLED
+        if (hits == 0) {
+            PyMemAllocatorEx *orig = i == 0 ? &raw_orig : domain_orig(i - 1);
+            PyMem_GetAllocator(d, orig);
+            PyMemAllocatorEx ours = {orig, counted_malloc, counted_calloc, counted_realloc, counted_free};
+            PyMem_SetAllocator(d, &ours);
+            if (i > 0) {
+                mem_in_chain[i - 1] = 1;
+            }
+            hits = mem_probe(d);
+        }
+#endif
+        if (hits != 1) {
+            if (hits < 0) {
+                PyErr_NoMemory();
+            }
+            else {
+                PyErr_Format(not_in_dialect ? not_in_dialect : PyExc_PermissionError,
+                             "not in dialect: the cell's memory cap cannot be enforced (the %s allocator counts each "
+                             "block %d times)", i == 0 ? "RAW" : i == 1 ? "MEM" : "OBJ", hits);
+            }
+            return -1;
+        }
+    }
+    return 0;
+}
+
 /* Test hook: whether MEM and OBJ are wrapped for this allocator at all, and whether ours is on top of each now. */
 void
 _PyRestricted_MemoryWrapped(int *wraps, int *mem_on_top, int *obj_on_top)
@@ -1135,6 +1228,10 @@ _PyRestricted_MemoryBegin(long long limit)
     mem_tripped = 0;
     mem_thread = PyThread_get_thread_ident();
     mem_domains_wrap();
+    if (mem_verify() < 0) {
+        mem_domains_unwrap();
+        return -1;
+    }
     mem_counting = 1;
     return 1;
 }

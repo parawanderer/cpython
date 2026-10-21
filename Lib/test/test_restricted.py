@@ -935,6 +935,36 @@ class MemoryTest(unittest.TestCase):
             gil_free = sysconfig.get_config_var("Py_GIL_DISABLED")
             self.assertEqual(_restricted._memory_wrapped()[1:], (wraps, wraps) if gil_free else (False, False))
 
+    # Doubled in a loop, not repeated: a repeat is judged by its size before anything is allocated, so only the count
+    # sees this one. 2**21 items is 16 MiB of pointers against an 8 MiB cap.
+    DOUBLING = "x = [0]\n" + "x = x + x\n" * 21 + "return 7"
+
+    def test_a_hook_that_drops_ours_is_put_back_at_the_next_entry(self):
+        # tracemalloc.stop() puts back the allocators its start() saw. Started before our first install (or with
+        # -X tracemalloc), that is the allocator from before ours, on every domain we wrapped: without the check at
+        # entry the next run counts nothing and the doubling is admitted with memory() == 0.
+        import tracemalloc
+        was_tracing = tracemalloc.is_tracing()
+        _restricted.reset()
+        tracemalloc.start()
+        try:
+            self.assertEqual(self.run_cell("return 1"), 1)
+        finally:
+            tracemalloc.stop()
+        try:
+            with self.assertRaisesRegex(_restricted.NotInDialect, "memory cap"):
+                self.run_cell(self.DOUBLING, memory=8 * 2 ** 20)
+            self.assertEqual(self.run_cell("x = [0] * 10 ** 6\nreturn 7"), 7)
+            self.assertGreaterEqual(_restricted.memory(), 8 * 10 ** 6, "counted again, once")
+            self.assertLess(_restricted.memory(), 9 * 10 ** 6, "and not twice")
+        finally:
+            if was_tracing:
+                tracemalloc.start()
+
+    def test_the_doubling_is_refused_without_any_hook_in_play(self):
+        with self.assertRaisesRegex(_restricted.NotInDialect, "memory cap"):
+            self.run_cell(self.DOUBLING, memory=8 * 2 ** 20)
+
     def test_an_empty_or_negative_repeat_is_not_judged(self):
         # Neither asks for memory, so each keeps CPython's own error: past Py_ssize_t is an OverflowError either way.
         self.assertEqual(self.run_cell('return len("a" * -10 ** 6)'), 0)
