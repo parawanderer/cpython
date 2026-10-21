@@ -965,6 +965,48 @@ class MemoryTest(unittest.TestCase):
         with self.assertRaisesRegex(_restricted.NotInDialect, "memory cap"):
             self.run_cell(self.DOUBLING, memory=8 * 2 ** 20)
 
+    def test_a_block_table_that_cannot_grow_refuses(self):
+        # The table is the count: a block it fails to record would be live and charged nothing, and so would every one
+        # after it. 2000 live blocks of 8 kB (RAW under pymalloc too), each far under the cap, so only the count can
+        # refuse them; the table fails from its 64th allocation.
+        _restricted._memory_table_fail_after(64)
+        try:
+            self.refused("keep = [[0] * 1000 for _ in range(2000)]\nreturn 7", memory=8 * 2 ** 20)
+        finally:
+            _restricted._memory_table_fail_after(-1)
+        self.assertEqual(self.run_cell("x = [0] * 10 ** 6\nreturn 7"), 7, "the next run counts again")
+        self.assertGreaterEqual(_restricted.memory(), 8 * 10 ** 6)
+
+    def test_a_hook_dropped_by_an_approved_call_is_put_back_when_it_returns(self):
+        # tracemalloc started outside the run sits under ours on MEM and OBJ (wrapped per run, without pymalloc); a
+        # leaf that stops it puts back the allocator from before ours, and the cell would run on uncounted.
+        import tracemalloc
+        was_tracing = tracemalloc.is_tracing()
+        def stop_hook():
+            tracemalloc.stop()
+            return 0
+        _restricted.allow_call(stop_hook, True)
+        tracemalloc.start()
+        try:
+            with self.assertRaisesRegex(_restricted.NotInDialect, "memory cap"):
+                self.run_cell("stop_hook()\n" + self.DOUBLING, memory=8 * 2 ** 20, stop_hook=stop_hook)
+        finally:
+            tracemalloc.stop()
+            if was_tracing:
+                tracemalloc.start()
+        self.assertEqual(self.run_cell("x = [0] * 10 ** 6\nreturn 7"), 7)
+        self.assertLess(_restricted.memory(), 9 * 10 ** 6, "counted once after it")
+
+    def test_a_domain_that_counts_each_block_twice_refuses(self):
+        # No Python-level hook can build this chain: a second copy of our wrapper, stacked from C.
+        _restricted._memory_stack_ours(True)
+        try:
+            with self.assertRaisesRegex(_restricted.NotInDialect, r"RAW allocator counts each block 2 times"):
+                self.run_cell("return 7")
+        finally:
+            _restricted._memory_stack_ours(False)
+        self.assertEqual(self.run_cell("return 7"), 7, "and runs again once it is gone")
+
     def test_an_empty_or_negative_repeat_is_not_judged(self):
         # Neither asks for memory, so each keeps CPython's own error: past Py_ssize_t is an OverflowError either way.
         self.assertEqual(self.run_cell('return len("a" * -10 ** 6)'), 0)
