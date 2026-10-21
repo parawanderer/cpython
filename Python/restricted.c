@@ -833,10 +833,15 @@ _PyRestricted_AllowFresh(PyObject *callable)
    wrapping those two counts the heap a run adds, net of what it frees, at almost no cost per small object. Without
    pymalloc (Emscripten and WASI build --without-pymalloc, so this is Pyodide's case; also PYTHONMALLOC=malloc or
    mimalloc) the MEM and OBJ domains call malloc directly and never reach RAW, so they are wrapped too, each block
-   counted, for the outermost run's extent only: outside a run they allocate with nothing in between. A request that would take the run past its cap FAILS before anything is allocated (so "a" * 10**11 is
-   refused in microseconds instead of touching 100 GB), and trips the run, so the MemoryError the caller raises ends as
-   NotInDialect however it is handled. The wrappers are installed once, as hooks that call the previous allocator (the
-   documented way to hook after initialization), and count only on the running thread while a run is in progress.
+   counted, for the outermost run's extent only: outside a run they allocate with nothing in between. A request that
+   would take the run past its cap FAILS before anything is allocated (so "a" * 10**11 is refused in microseconds
+   instead of touching 100 GB), and trips the run, so the MemoryError the caller raises ends as NotInDialect however it
+   is handled. The wrappers are hooks that call the previous allocator (the documented way to hook after
+   initialization): RAW and the arenas stay installed from the first run on, MEM and OBJ are wrapped per run, and every
+   entry checks each is still in its domain's chain (mem_verify). They count only on the running thread while a run is
+   in progress. A free-threaded build keeps MEM and OBJ wrapped from the first run on, but that FIRST wrap, and RAW's
+   install, still swap a domain with no lock while another thread may allocate: a named limit, not Pyodide's build
+   (which has a GIL).
 
    A request CPython refuses with its own overflow guard never reaches an allocator: on a 32-bit build "a" * 10**11
    fails converting the count to Py_ssize_t, an OverflowError and not the cap. _PyRestricted_RepeatAdmit judges a
