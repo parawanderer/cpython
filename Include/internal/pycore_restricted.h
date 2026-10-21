@@ -125,8 +125,14 @@ PyAPI_FUNC(void) _PyRestricted_TableSizes(Py_ssize_t *n_owned, Py_ssize_t *n_lif
 /* Memory (slice 5): a byte cap per run, counted at the RAW and arena allocators. */
 PyAPI_FUNC(int) _PyRestricted_MemoryBegin(long long limit);
 PyAPI_FUNC(int) _PyRestricted_MemoryEnd(long long *peak);
+/* After an approved call returns: is the cap's hook still in every domain's chain? 0, or -1 with NotInDialect set. */
+extern int _PyRestricted_MemoryRecheck(void);
 /* Test hook: are MEM and OBJ wrapped for this allocator (-1 before the first run), and is ours on top of each. */
 PyAPI_FUNC(void) _PyRestricted_MemoryWrapped(int *wraps, int *mem_on_top, int *obj_on_top);
+/* Test hook: the block table's allocator fails after `n` more allocations (-1: never). */
+PyAPI_FUNC(void) _PyRestricted_MemoryTableFailAfter(long n);
+/* Test hook: stack a second copy of our wrapper on RAW (1), or take it off again (0). -1 if it is not on top. */
+PyAPI_FUNC(int) _PyRestricted_MemoryStackOurs(int on);
 /* Is a sequence repeat's size within the cap? -1 when it is not (the run is tripped). Objects/abstract.c. */
 extern int _PyRestricted_RepeatAdmit(PyObject *seq, PyObject *n);
 

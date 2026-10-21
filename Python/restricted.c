@@ -370,6 +370,20 @@ has_cost(PyObject *callable)
     return r;
 }
 
+/* An unlifted call has returned: one into C (len, an approved unlifted callable) was host code, which can drop the
+   memory cap's hook, so the cap is checked again. A Python function's body is gated, and every host call it makes is
+   checked on its own return. */
+static PyObject *
+host_returned(PyObject *callable, PyObject *res)
+{
+    PyObject *f = PyMethod_Check(callable) ? PyMethod_GET_FUNCTION(callable) : callable;
+    if (!PyFunction_Check(f) && _PyRestricted_MemoryRecheck() < 0) {
+        Py_XDECREF(res);
+        return NULL;
+    }
+    return res;
+}
+
 /* Call `callable` from restricted code: gated, and lifted when it is a listed C callable. */
 PyObject *
 _PyRestricted_Vectorcall(PyThreadState *tstate, PyObject *callable, PyObject *const *args, size_t nargsf,
@@ -386,7 +400,7 @@ _PyRestricted_Vectorcall(PyThreadState *tstate, PyObject *callable, PyObject *co
         if (has_cost(callable) && run_checker_vector(tstate, costs, callable, args, nargsf, kwnames) < 0) {
             return NULL;
         }
-        return PyObject_Vectorcall(callable, args, nargsf, kwnames);
+        return host_returned(callable, PyObject_Vectorcall(callable, args, nargsf, kwnames));
     }
     /* The checker sees the arguments as a tuple and a dict. */
     if (run_checker_vector(tstate, calls, callable, args, nargsf, kwnames) < 0) {
@@ -395,6 +409,10 @@ _PyRestricted_Vectorcall(PyThreadState *tstate, PyObject *callable, PyObject *co
     _PyRestrictedSaved saved = _PyRestricted_Lift(tstate);
     PyObject *res = PyObject_Vectorcall(callable, args, nargsf, kwnames);
     _PyRestricted_Restore(tstate, saved);
+    if (_PyRestricted_MemoryRecheck() < 0) {
+        Py_XDECREF(res);
+        return NULL;
+    }
     mark_fresh(callable, res, args, PyVectorcall_NARGS(nargsf) + (kwnames ? PyTuple_GET_SIZE(kwnames) : 0),
                PyMethod_Check(callable) ? PyMethod_GET_SELF(callable) : NULL);
     return res;
@@ -415,7 +433,7 @@ _PyRestricted_Call(PyThreadState *tstate, PyObject *callable, PyObject *args, Py
         if (has_cost(callable) && run_checker(tstate, costs, callable, args, kwargs) < 0) {
             return NULL;
         }
-        return PyObject_Call(callable, args, kwargs);
+        return host_returned(callable, PyObject_Call(callable, args, kwargs));
     }
     if (run_checker(tstate, calls, callable, args, kwargs) < 0) {
         return NULL;
@@ -423,6 +441,10 @@ _PyRestricted_Call(PyThreadState *tstate, PyObject *callable, PyObject *args, Py
     _PyRestrictedSaved saved = _PyRestricted_Lift(tstate);
     PyObject *res = PyObject_Call(callable, args, kwargs);
     _PyRestricted_Restore(tstate, saved);
+    if (_PyRestricted_MemoryRecheck() < 0) {
+        Py_XDECREF(res);
+        return NULL;
+    }
     if (res != NULL && PyTuple_Check(args)) {
         /* Keyword values are not compared here: a leaf handing back a keyword argument is left fresh-marked only
            if the manifest says fresh, and the corpus has no such call (f(*a, **k) is rare). */
@@ -838,7 +860,7 @@ _PyRestricted_AllowFresh(PyObject *callable)
    instead of touching 100 GB), and trips the run, so the MemoryError the caller raises ends as NotInDialect however it
    is handled. The wrappers are hooks that call the previous allocator (the documented way to hook after
    initialization): RAW and the arenas stay installed from the first run on, MEM and OBJ are wrapped per run, and every
-   entry checks each is still in its domain's chain (mem_verify). They count only on the running thread while a run is
+   entry, and every approved call into C when it returns, checks each is still in its domain's chain (mem_verify). They count only on the running thread while a run is
    in progress. A free-threaded build keeps MEM and OBJ wrapped from the first run on, but that FIRST wrap, and RAW's
    install, still swap a domain with no lock while another thread may allocate: a named limit, not Pyodide's build
    (which has a GIL).
@@ -869,7 +891,20 @@ static _Py_hashtable_t *mem_blocks;         /* block -> size, for the blocks a r
 /* The block table is the cap's own bookkeeping and allocates from the C library, under every domain: through RAW it
    would reach whatever hook sits there, and a hook that later chains back to our wrapper (tracemalloc restarted over
    it) would record the table's own entries, without end. */
-static void *ht_malloc(size_t n) { return malloc(n); }
+static long ht_fail_after = -1;     /* test hook: allocations left before the table's allocator fails, -1 never */
+
+static void *
+ht_malloc(size_t n)
+{
+    if (ht_fail_after == 0) {
+        return NULL;
+    }
+    if (ht_fail_after > 0) {
+        ht_fail_after--;
+    }
+    return malloc(n);
+}
+
 static void ht_free(void *p) { free(p); }
 
 static inline int
@@ -899,13 +934,32 @@ mem_grew(long long n)
     }
 }
 
+/* Record a block the run just took from `o`. The table IS the count: a block it fails to record would be live and
+   charged nothing, and so would every one after it, so a failed insert trips the run and the block is given back.
+   (The owned set's failed insert is the safe side by itself, "not owned"; this one is not.) */
 static void *
-mem_record(void *p, size_t n)
+mem_record(PyMemAllocatorEx *o, void *p, size_t n)
 {
-    if (p != NULL && _Py_hashtable_set(mem_blocks, p, (void *)(uintptr_t)(n ? n : 1)) == 0) {
-        mem_grew((long long)n);
+    if (p == NULL) {
+        return NULL;
     }
+    if (_Py_hashtable_set(mem_blocks, p, (void *)(uintptr_t)(n ? n : 1)) < 0) {
+        mem_tripped = 1;
+        o->free(o->ctx, p);
+        return NULL;
+    }
+    mem_grew((long long)n);
     return p;
+}
+
+/* Put back the size a failed realloc took out of the table: the block is still live. Unrecorded, it would be charged
+   again by the next realloc and never given back by its free, so a failed insert trips the run. */
+static void
+mem_rerecord(void *p, long long old)
+{
+    if (old && _Py_hashtable_set(mem_blocks, p, (void *)(uintptr_t)old) < 0) {
+        mem_tripped = 1;
+    }
 }
 
 static long long
@@ -931,7 +985,7 @@ counted_malloc(void *ctx, size_t n)
     if (!mem_admit((long long)n)) {
         return NULL;
     }
-    return mem_record(o->malloc(o->ctx, n), n);
+    return mem_record(o, o->malloc(o->ctx, n), n);
 }
 
 static void *
@@ -949,7 +1003,7 @@ counted_calloc(void *ctx, size_t nelem, size_t elsize)
     if (!mem_admit((long long)n)) {
         return NULL;
     }
-    return mem_record(o->calloc(o->ctx, nelem, elsize), n);
+    return mem_record(o, o->calloc(o->ctx, nelem, elsize), n);
 }
 
 static void *
@@ -961,20 +1015,22 @@ counted_realloc(void *ctx, void *ptr, size_t n)
     }
     long long old = mem_forget(ptr);          /* 0 for a block from before the run: then all of n counts */
     if (!mem_admit((long long)n - old)) {
-        if (old) {
-            (void)_Py_hashtable_set(mem_blocks, ptr, (void *)(uintptr_t)old);
-        }
+        mem_rerecord(ptr, old);
         return NULL;
     }
     void *p = o->realloc(o->ctx, ptr, n);
     if (p == NULL) {
-        if (old) {
-            (void)_Py_hashtable_set(mem_blocks, ptr, (void *)(uintptr_t)old);
-        }
+        mem_rerecord(ptr, old);
         return NULL;
     }
     mem_live -= old;
-    return mem_record(p, n);
+    /* The block may have moved, so it cannot be failed now; unrecorded, it stays charged (its free gives nothing
+       back) and the run is refused. */
+    if (_Py_hashtable_set(mem_blocks, p, (void *)(uintptr_t)(n ? n : 1)) < 0) {
+        mem_tripped = 1;
+    }
+    mem_grew((long long)n);
+    return p;
 }
 
 static void
@@ -1152,7 +1208,7 @@ mem_probe(PyMemAllocatorDomain d)
     return mem_probe_hits;
 }
 
-/* At every outermost entry: is the cap's hook in the chain of every domain the run allocates through? A hook from
+/* At every outermost entry, and when an approved call into C returns: is the cap's hook in the chain of every domain the run allocates through? A hook from
    Python code can take it out: tracemalloc.stop() puts back the allocators its start() saw, from before ours, and then
    a run counts nothing (a 2**26-item list was admitted with memory() == 0). Each domain is probed; one that lost ours
    gets it back on top of whatever is there now, and one still not counting exactly once refuses the run. The arena
@@ -1214,6 +1270,50 @@ _PyRestricted_MemoryWrapped(int *wraps, int *mem_on_top, int *obj_on_top)
     *mem_on_top = mem_is_ours(&cur, &mem_orig);
     PyMem_GetAllocator(PYMEM_DOMAIN_OBJ, &cur);
     *obj_on_top = mem_is_ours(&cur, &obj_orig);
+}
+
+void
+_PyRestricted_MemoryTableFailAfter(long n)
+{
+    ht_fail_after = n;
+}
+
+static PyMemAllocatorEx stacked_orig;
+
+int
+_PyRestricted_MemoryStackOurs(int on)
+{
+    PyMemAllocatorEx cur;
+    PyMem_GetAllocator(PYMEM_DOMAIN_RAW, &cur);
+    if (on) {
+        stacked_orig = cur;
+        PyMemAllocatorEx ours = {&stacked_orig, counted_malloc, counted_calloc, counted_realloc, counted_free};
+        PyMem_SetAllocator(PYMEM_DOMAIN_RAW, &ours);
+        return 0;
+    }
+    if (!mem_is_ours(&cur, &stacked_orig)) {
+        return -1;
+    }
+    PyMem_SetAllocator(PYMEM_DOMAIN_RAW, &stacked_orig);
+    return 0;
+}
+
+/* The entry's check again, when an approved call returns: host code (tracemalloc.stop() in a leaf) can drop the hook
+   mid-run, and the cell would run on uncounted. The probe is not the run's, so counting is off while it runs. A hook
+   that refuses here trips the run, so a cell that swallows the error is still refused at the end. */
+int
+_PyRestricted_MemoryRecheck(void)
+{
+    if (!mem_mine()) {
+        return 0;
+    }
+    mem_counting = 0;
+    int r = mem_verify();
+    mem_counting = 1;
+    if (r < 0) {
+        mem_tripped = 1;
+    }
+    return r;
 }
 
 /* Start counting for a run on this thread, capped at `limit` bytes. Returns 1 when this call started the count (the

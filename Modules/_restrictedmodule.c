@@ -273,6 +273,33 @@ restricted_memory_wrapped(PyObject *module, PyObject *unused)
     return Py_BuildValue("(iOO)", wraps, mem ? Py_True : Py_False, obj ? Py_True : Py_False);
 }
 
+/* _memory_table_fail_after(n): the cap's block table fails to allocate after n more allocations, -1 never (tests). */
+static PyObject *
+restricted_memory_table_fail_after(PyObject *module, PyObject *arg)
+{
+    long n = PyLong_AsLong(arg);
+    if (n == -1 && PyErr_Occurred()) {
+        return NULL;
+    }
+    _PyRestricted_MemoryTableFailAfter(n);
+    Py_RETURN_NONE;
+}
+
+/* _memory_stack_ours(on): stack a second copy of the cap's wrapper on RAW, or take it off (tests). */
+static PyObject *
+restricted_memory_stack_ours(PyObject *module, PyObject *arg)
+{
+    int on = PyObject_IsTrue(arg);
+    if (on < 0) {
+        return NULL;
+    }
+    if (_PyRestricted_MemoryStackOurs(on) < 0) {
+        PyErr_SetString(PyExc_RuntimeError, "the stacked wrapper is not on top of RAW");
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
 /* memory(): the most heap the last run held at once, in bytes (RAW blocks and arenas). */
 static PyObject *
 restricted_memory(PyObject *module, PyObject *unused)
@@ -439,6 +466,10 @@ static PyMethodDef restricted_methods[] = {
      "_table_sizes()\n--\n\nThe sizes of the owned set and of the lifted generators' table (tests)."},
     {"_memory_wrapped", restricted_memory_wrapped, METH_NOARGS,
      "_memory_wrapped()\n--\n\n(wraps MEM/OBJ, ours on top of MEM, of OBJ) (tests)."},
+    {"_memory_table_fail_after", restricted_memory_table_fail_after, METH_O,
+     "_memory_table_fail_after(n, /)\n--\n\nThe cap's block table fails after n more allocations, -1 never (tests)."},
+    {"_memory_stack_ours", restricted_memory_stack_ours, METH_O,
+     "_memory_stack_ours(on, /)\n--\n\nStack a second copy of the cap's wrapper on RAW, or take it off (tests)."},
     {"memory", restricted_memory, METH_NOARGS,
      "memory()\n--\n\nThe most heap the last run held at once, in bytes."},
     {"steps", restricted_steps, METH_NOARGS,
