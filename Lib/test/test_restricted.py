@@ -1256,6 +1256,52 @@ class RiskyRegexTest(unittest.TestCase):
             check(re.search, None, ("^(a+ # )\n)+$", "a"), {"flags": re.VERBOSE})
 
 
+def _regex_corpus():
+    """The regex entries of window-ml's tests/fixtures/dialect-vectors/halting.json written in Python or both: the one
+    corpus both dialects' checks are held to (window-ml docs/spec/PYTHON_DIALECT.md, "one DEFINITION and one CORPUS").
+    Found through WML_DIALECT_VECTORS (the directory), else a window-ml checkout beside this one; None without either,
+    or when the file found holds no regex entries yet."""
+    import json, os
+    here = os.path.dirname(os.path.abspath(__file__))
+    for d in (os.environ.get("WML_DIALECT_VECTORS"),
+              os.path.join(here, "..", "..", "..", "window-ml", "tests", "fixtures", "dialect-vectors")):
+        if d and os.path.exists(os.path.join(d, "halting.json")):
+            with open(os.path.join(d, "halting.json"), encoding="utf-8") as f:
+                corpus = [v for v in json.load(f) if "regex" in v and v["regex"]["dialect"] in ("py", "both")]
+            return corpus or None       # a checkout from before the corpus has none: nothing to hold this side to
+    return None
+
+
+@unittest.skipIf(_regex_corpus() is None, "no window-ml dialect vectors: set WML_DIALECT_VECTORS to its tests/fixtures/dialect-vectors")
+class RegexCorpusTest(unittest.TestCase):
+    """This dialect's half of the regex corpus: each entry's verdict, from risky_regex and risky_parse together. A
+    verdict that differs is a failure; the one open gap is the price (no port of window-ml's regexWork), so a "priced"
+    entry must pass the shape checks, which leave it to the price, and its price half is skipped as the todo."""
+
+    FLAGS = {"i": 2, "m": 8, "s": 16, "x": 64}      # re.I, re.M, re.S, re.X; g, u and y are JS's
+
+    def test_every_entry_gets_its_verdict(self):
+        import re
+        corpus = _regex_corpus()
+        self.assertGreaterEqual(len(corpus), 20)
+        priced = []
+        for v in corpus:
+            r = v["regex"]
+            flags = sum(self.FLAGS.get(c, 0) for c in r["flags"])
+            with self.subTest(v["name"]):
+                re.compile(r["pattern"], flags)     # a pattern written in Python compiles as Python
+                shape = restricted.risky_regex(r["pattern"]) or restricted.risky_parse(r["pattern"], flags)
+                if r["verdict"] == "refused":
+                    self.assertIsNotNone(shape, f"{r['pattern']!r}: {v['reason']}")
+                else:
+                    self.assertIsNone(shape, f"{r['pattern']!r} is refused on its shape: {shape}")
+                    if r["verdict"] == "priced":
+                        priced.append(v["name"])
+        if priced:
+            self.skipTest(f"todo: {len(priced)} priced entries pass the shape check, but this dialect does not price a "
+                          "search on its input (no port of regexWork; the python-cancel lane)")
+
+
 class PrintTest(unittest.TestCase):
     """print() in a cell: each argument converted by the cell's own gated str(), the lifted writer handed only
     strings, and nothing but the host's stream reachable. The corpus prints in a fifth of its cells."""
