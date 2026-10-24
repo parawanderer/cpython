@@ -1221,6 +1221,22 @@ class UndoTest(unittest.TestCase):
         self.assertNotIn("zs", ns)
 
 
+class RiskyRegexTest(unittest.TestCase):
+    """risky_regex, the port of the JS dialect's riskyRegex (window-ml src/readonly-exec/limits.ts): the same verdict on
+    the same pattern. An exact count opens no choice, so a repeated group of one passes; a choice inside a repeated
+    group, or a group with a choice under any count, is refused."""
+
+    def test_exact_counts_pass(self):
+        for p in [r"(\d{3})+", r"\B(?=(\d{3})+(?!\d))", "((ab){3})+", "(a{2,2})+", "(a{1})+", "(?:x{4}y)*", "(a+){1}",
+                  "(a{)+", r"(a\{3})+"]:
+            self.assertIsNone(restricted.risky_regex(p), p)
+
+    def test_choices_under_a_repeat_are_refused(self):
+        for p in ["(a+)+", r"(\w+\s?)*", "(a|a)+", "(a{2}|a)+", "((a+){2})+", r"(\d{3}\d*)+", "(a+){20}", "(a|ab){30}",
+                  "(?:a+){2}", "(a{0,1})+", "(a{2,3})+", "(a{2,})+", "(a{3}?)+", "((a{2})+)+"]:
+            self.assertIsNotNone(restricted.risky_regex(p), p)
+
+
 class PrintTest(unittest.TestCase):
     """print() in a cell: each argument converted by the cell's own gated str(), the lifted writer handed only
     strings, and nothing but the host's stream reachable. The corpus prints in a fifth of its cells."""

@@ -300,21 +300,28 @@ def risky_regex(source):
     """Why a regex could backtrack exponentially, or None: a REPEATED group that itself contains a quantifier or an
     alternation ((a+)+, (\\w+\\s?)*, (a|a)+). sre is C with no match timeout, so one match of such a pattern on a
     40-character string runs for hours in a single call the budget never sees. Conservative by design, as the JS
-    dialect's riskyRegex (src/readonly-exec/limits.ts), of which this is a port: (?:x|y)+ is refused with the rest."""
+    dialect's riskyRegex (src/readonly-exec/limits.ts), of which this is a port: (?:x|y)+ is refused with the rest.
+    An EXACT count (\\d{3}) is not a quantifier inside a group: it repeats a fixed-width piece and opens no choice, so
+    (\\d{3})+ passes, while an exact count of a group with a choice in it ((a+){20}, (a|ab){30}) is refused."""
     import re
     stack = []              # one frame per open group: [has a quantifier inside, has an alternation inside]
 
-    def is_repeat(i):
+    # What repeats the atom ending before i: "var" for a count that can vary (*, +, {2,}, {0,1}), "exact" for {n} or
+    # {n,n} with n > 1, None for none (or {0}, {1}, which repeat nothing).
+    def repeat_at(i):
         if i >= len(source):
-            return False
+            return None
         c = source[i]
         if c in "*+":
-            return True
+            return "var"
         if c != "{":
-            return False
+            return None
         m = re.match(r"\{(\d+)(,(\d*))?\}", source[i:])
-        return bool(m) and ((m.group(3) == "" or int(m.group(3)) > 1) if m.group(2) is not None
-                            else int(m.group(1)) > 1)
+        if not m:
+            return None
+        if m.group(2) is not None and (m.group(3) == "" or int(m.group(3)) != int(m.group(1))):
+            return "var"
+        return "exact" if int(m.group(1)) > 1 else None
 
     def mark(k):
         for f in stack:
@@ -349,14 +356,15 @@ def risky_regex(source):
             continue
         if c == ")":
             g = stack.pop() if stack else None
-            if g is not None and is_repeat(i + 1) and (g[0] or g[1]):
+            r = repeat_at(i + 1)
+            if g is not None and r and (g[0] or g[1]):
                 return ("a repeated group that contains a quantifier" if g[0]
                         else "a repeated group that contains an alternation")
-            if g is not None and is_repeat(i + 1):
+            if g is not None and r == "var":
                 mark(0)
             i += 1
             continue
-        if is_repeat(i) or c == "?":
+        if repeat_at(i) == "var" or c == "?":
             mark(0)
         i += 1
     return None
