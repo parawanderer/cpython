@@ -370,6 +370,71 @@ def risky_regex(source):
     return None
 
 
+def risky_parse(pattern, flags=0):
+    """Why a regex could backtrack exponentially, read off re's OWN parse of it, or None. risky_regex reads the pattern
+    as the JS dialect's riskyRegex does, so it misses what only Python spells: a {,n} count, a verbose pattern whose
+    comment holds a bracket ((?x), or the flag passed as 64), a conditional group's two branches. This walks the tree
+    sre compiles, so every spelling re accepts is read as re reads it: a repeat of more than one whose body holds a
+    choice (a count that varies, an alternation, a conditional) is refused. Both checks run; either refuses."""
+    from re import _parser, _constants as c
+    REPEATS = (c.MAX_REPEAT, c.MIN_REPEAT, c.POSSESSIVE_REPEAT)
+
+    def items(sub):
+        for op, av in sub:
+            yield op, av
+
+    def has_choice(sub):
+        for op, av in items(sub):
+            if op in REPEATS:
+                lo, hi, body = av
+                if hi != lo or op is c.MIN_REPEAT and hi > 1 or has_choice(body):
+                    return True
+            elif op is c.BRANCH:
+                if len(av[1]) > 1:
+                    return True
+            elif op is c.GROUPREF_EXISTS:
+                return True
+            elif op is c.SUBPATTERN:
+                if has_choice(av[-1]):
+                    return True
+            elif op in (c.ASSERT, c.ASSERT_NOT):
+                if has_choice(av[1]):
+                    return True
+            elif op is c.ATOMIC_GROUP:
+                if has_choice(av):
+                    return True
+        return False
+
+    def walk(sub):
+        for op, av in items(sub):
+            if op in REPEATS:
+                lo, hi, body = av
+                if hi > 1 and has_choice(body):
+                    return "a repeated group that contains a quantifier or an alternation"
+                why = walk(body)
+            elif op is c.BRANCH:
+                why = next(filter(None, map(walk, av[1])), None)
+            elif op is c.GROUPREF_EXISTS:
+                why = walk(av[1]) or (walk(av[2]) if av[2] is not None else None)
+            elif op is c.SUBPATTERN:
+                why = walk(av[-1])
+            elif op in (c.ASSERT, c.ASSERT_NOT):
+                why = walk(av[1])
+            elif op is c.ATOMIC_GROUP:
+                why = walk(av)
+            else:
+                why = None
+            if why:
+                return why
+        return None
+
+    try:
+        tree = _parser.parse(pattern, flags)
+    except Exception:
+        return None                 # re itself refuses it, with its own error, when the call compiles it
+    return walk(tree)
+
+
 # re's functions: lifted leaves (sre is C; re's own Python resolves nothing from its arguments) behind a check that the
 # pattern cannot backtrack exponentially, and the callback rule for a callable `repl`.
 _REGEX = ("compile", "search", "match", "fullmatch", "findall", "finditer", "sub", "subn", "split")
@@ -384,7 +449,11 @@ def regex_check(name):
             pattern = pattern.decode("latin-1")
         if not isinstance(pattern, str):
             raise NotInDialect(f"not in dialect: re.{name}() needs a pattern string")
-        why = risky_regex(pattern)
+        # The flags as the call passes them: positionally after the pattern's other operands, or by name.
+        at = {"compile": 1, "search": 2, "match": 2, "fullmatch": 2, "findall": 2, "finditer": 2, "split": 3,
+              "sub": 4, "subn": 4}[name]
+        flags = args[at] if len(args) > at else (kwargs or {}).get("flags", 0)
+        why = risky_regex(pattern) or risky_parse(pattern, flags if isinstance(flags, int) else 0)
         if why:
             raise NotInDialect(f"not in dialect: re.{name}({pattern!r}) could backtrack exponentially ({why})")
         arguments(func, self, args, kwargs)

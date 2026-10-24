@@ -1236,6 +1236,25 @@ class RiskyRegexTest(unittest.TestCase):
                   "(?:a+){2}", "(a{0,1})+", "(a{2,3})+", "(a{2,})+", "(a{3}?)+", "((a{2})+)+"]:
             self.assertIsNotNone(restricted.risky_regex(p), p)
 
+    def test_python_only_spellings_are_read_off_the_parse_tree(self):
+        # Each is (a+)+ or (a?)+ in a spelling only Python has, which risky_regex (the JS port) reads as harmless.
+        for p, flags in [(r"^(a{,5})+$", 0), ("(?x)^(a+ # )\n)+$", 0), ("^(a+ # )\n)+$", 64),
+                         (r"^(x)?(?(1)b|(a+))+$", 0)]:
+            self.assertIsNone(restricted.risky_regex(p), f"{p!r}: the hand parser misses it, which is why the tree check exists")
+            self.assertIsNotNone(restricted.risky_parse(p, flags), p)
+        self.assertIsNone(restricted.risky_parse("^(a+ # )\n)+$", 0), "without the verbose flag the comment is text")
+        for p in [r"(\d{3})+", r"\B(?=(\d{3})+(?!\d))", r"\d+", r"(a+){1}", "(a|b)+"]:
+            self.assertIsNone(restricted.risky_parse(p), p)
+
+    def test_the_call_refuses_either_check(self):
+        import re
+        check = restricted.regex_check("search")
+        for args in [(r"^(a{,5})+$", "a"), ("^(a+ # )\n)+$", "a", 64), (r"(a+)+", "a")]:
+            with self.assertRaises(_restricted.NotInDialect, msg=repr(args)):
+                check(re.search, None, args, {})
+        with self.assertRaises(_restricted.NotInDialect):
+            check(re.search, None, ("^(a+ # )\n)+$", "a"), {"flags": re.VERBOSE})
+
 
 class PrintTest(unittest.TestCase):
     """print() in a cell: each argument converted by the cell's own gated str(), the lifted writer handed only
