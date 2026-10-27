@@ -18,8 +18,8 @@
 #include "pycore_pystate.h"      // _PyThreadState_GET()
 #include "pycore_tstate.h"      // _PyThreadStateImpl
 
-/* The step budget a run gets when the caller names none: about a second of interpreter work (measured: see
-   DEFAULT_BUDGET in Lib/restricted.py), the same bound the JS dialect's STEP_BUDGET sets. */
+/* The step budget a run gets when the caller names none: about 2 s of interpreter work in Pyodide (median 7.1M
+   steps/s; see DEFAULT_BUDGET in Lib/restricted.py), about twice the time the JS dialect's STEP_BUDGET allows. */
 #define RESTRICTED_DEFAULT_BUDGET 15000000LL
 /* How deep a program's own frames may sit above where the run began, in Python frames (the JS dialect's
    MAX_CALL_DEPTH). */
