@@ -338,6 +338,29 @@ restricted_call_lifted(PyObject *module, PyObject *const *args, Py_ssize_t nargs
     return result;
 }
 
+/* charge(n): spend n steps of the running cell's budget at once, for C work priced before it runs; NotInDialect when the
+   budget cannot cover it. A negative n is refused: nothing gives steps back. Outside a run, nothing is charged. */
+static PyObject *
+restricted_charge(PyObject *module, PyObject *arg)
+{
+    int overflow;
+    long long n = PyLong_AsLongLongAndOverflow(arg, &overflow);
+    if (n == -1 && PyErr_Occurred()) {
+        return NULL;
+    }
+    if (overflow < 0 || (!overflow && n < 0)) {
+        PyErr_SetString(PyExc_ValueError, "charge: a negative number of steps");
+        return NULL;
+    }
+    if (overflow > 0) {
+        n = LLONG_MAX;
+    }
+    if (_PyRestricted_Charge(_PyThreadState_GET(), n) < 0) {
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
 /* active(): whether the gate is active for this thread now. */
 static PyObject *
 restricted_active(PyObject *module, PyObject *Py_UNUSED(ignored))
@@ -476,6 +499,8 @@ static PyMethodDef restricted_methods[] = {
      "steps()\n--\n\nThe steps the last finished run used (budget + 1 when it ran out)."},
     {"call_lifted", _PyCFunction_CAST(restricted_call_lifted), METH_FASTCALL,
      "call_lifted(callable, *args)\n--\n\nCall with the restriction lifted, as an approved C leaf runs (tests only)."},
+    {"charge", restricted_charge, METH_O,
+     "charge(n, /)\n--\n\nSpend n steps of the running cell's budget at once, for priced C work; NotInDialect past it."},
     {"active", restricted_active, METH_NOARGS,
      "active()\n--\n\nWhether the restricted-mode gate is active for this thread."},
     {"build", restricted_build, METH_NOARGS,
