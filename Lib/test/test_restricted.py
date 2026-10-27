@@ -1341,8 +1341,8 @@ class RegexCostTest(unittest.TestCase):
 
     def setUp(self):
         import re
-        _restricted.allow_module("re", ["search", "findall", "compile"])
-        for name in ("search", "findall", "compile"):
+        _restricted.allow_module("re", ["search", "findall", "compile", "sub", "subn"])
+        for name in ("search", "findall", "compile", "sub", "subn"):
             _restricted.allow_call(getattr(re, name), True, restricted.regex_check(name))
         _restricted.allow_call(len, False)
         _restricted.allow_call(swallow, True)
@@ -1421,6 +1421,15 @@ class RegexCostTest(unittest.TestCase):
             self.run_cell("import re\nreturn re.search('a+b', 'a' * 300000)")
         self.assertLess(time.perf_counter() - t, 1.0, "refused on its price, not after the search")
         self.assertEqual(_restricted.steps(), restricted.DEFAULT_BUDGET + 1)
+
+    def test_sub_prices_its_input_not_its_replacement(self):
+        # sub and subn take the replacement second; pricing it ran re.sub('a+b', 'x', 'a' * 300000) for 20 s.
+        for name in ("sub", "subn"):
+            for call in (f"re.{name}('a+b', 'x', 'a' * 300000)", f"re.{name}('a+b', 'x', string='a' * 300000)"):
+                t = time.perf_counter()
+                with self.assertRaisesRegex(_restricted.NotInDialect, "step budget", msg=call):
+                    self.run_cell(f"import re\nreturn {call}")
+                self.assertLess(time.perf_counter() - t, 1.0, call)
 
     def test_a_cheap_search_runs_and_its_price_is_spent(self):
         self.assertEqual(self.run_cell("import re\nreturn len(re.findall('a+b', 'a' * 3000))"), 0)

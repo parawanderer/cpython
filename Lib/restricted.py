@@ -684,7 +684,9 @@ def regex_check(name):
         if why:
             raise NotInDialect(f"not in dialect: re.{name}({pattern!r}) could backtrack exponentially ({why})")
         # The search's price, charged before it runs, the scans first; compile has no input and charges nothing.
-        string = args[1] if len(args) > 1 else (kwargs or {}).get("string")
+        # The input: after the replacement for sub and subn, else right after the pattern.
+        at = 2 if name in ("sub", "subn") else 1
+        string = args[at] if len(args) > at else (kwargs or {}).get("string")
         if name != "compile" and isinstance(string, (str, bytes)):
             if isinstance(string, bytes):
                 string = string.decode("latin-1")
