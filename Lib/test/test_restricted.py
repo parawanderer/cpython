@@ -6,7 +6,9 @@ tests/fixtures/dialect-vectors/) are the acceptance suite once the gate exists.
 """
 
 import gc
+import math
 import sysconfig
+import time
 import types
 import unittest
 
@@ -1272,11 +1274,40 @@ def _regex_corpus():
     return None
 
 
+def _regex_input(inp):
+    """A corpus entry's input as the text it stands for: a string, or { repeat, n, tail }."""
+    if inp is None or isinstance(inp, str):
+        return inp or ""
+    return inp["repeat"] * inp["n"] + inp.get("tail", "")
+
+
+def _vectors_dir():
+    import os
+    here = os.path.dirname(os.path.abspath(__file__))
+    for d in (os.environ.get("WML_DIALECT_VECTORS"),
+              os.path.join(here, "..", "..", "..", "window-ml", "tests", "fixtures", "dialect-vectors")):
+        if d and os.path.exists(os.path.join(d, "halting.json")):
+            return d
+    return None
+
+
+def _cost_corpus():
+    """window-ml's tests/fixtures/dialect-vectors/regex-cost.json, the entries written in Python or both: each a pattern,
+    an input recipe and the order of the bound on it, which window-ml's regexWork is held to as well. None without the
+    directory, or a checkout from before the file."""
+    import json, os
+    d = _vectors_dir()
+    if d is None or not os.path.exists(os.path.join(d, "regex-cost.json")):
+        return None
+    with open(os.path.join(d, "regex-cost.json"), encoding="utf-8") as f:
+        return [v for v in json.load(f) if v["dialect"] in ("py", "both")]
+
+
 @unittest.skipIf(_regex_corpus() is None, "no window-ml dialect vectors: set WML_DIALECT_VECTORS to its tests/fixtures/dialect-vectors")
 class RegexCorpusTest(unittest.TestCase):
     """This dialect's half of the regex corpus: each entry's verdict, from risky_regex and risky_parse together. A
-    verdict that differs is a failure; the one open gap is the price (no port of window-ml's regexWork), so a "priced"
-    entry must pass the shape checks, which leave it to the price, and its price half is skipped as the todo."""
+    verdict that differs is a failure. A "priced" entry passes the shape checks and is over the budget on its input; an
+    "ok" one with an input is within it."""
 
     FLAGS = {"i": 2, "m": 8, "s": 16, "x": 64}      # re.I, re.M, re.S, re.X; g, u and y are JS's
 
@@ -1284,7 +1315,6 @@ class RegexCorpusTest(unittest.TestCase):
         import re
         corpus = _regex_corpus()
         self.assertGreaterEqual(len(corpus), 20)
-        priced = []
         for v in corpus:
             r = v["regex"]
             flags = sum(self.FLAGS.get(c, 0) for c in r["flags"])
@@ -1295,11 +1325,154 @@ class RegexCorpusTest(unittest.TestCase):
                     self.assertIsNotNone(shape, f"{r['pattern']!r}: {v['reason']}")
                 else:
                     self.assertIsNone(shape, f"{r['pattern']!r} is refused on its shape: {shape}")
+                    steps = restricted.regex_steps(r["pattern"], flags, _regex_input(r.get("input")))
+                    budget = v.get("budget", restricted.DEFAULT_BUDGET)
                     if r["verdict"] == "priced":
-                        priced.append(v["name"])
-        if priced:
-            self.skipTest(f"todo: {len(priced)} priced entries pass the shape check, but this dialect does not price a "
-                          "search on its input (no port of regexWork; the python-cancel lane)")
+                        self.assertGreater(steps, budget, f"{r['pattern']!r}: {v['reason']}")
+                    else:
+                        self.assertLessEqual(steps, budget, f"{r['pattern']!r} is priced over the budget")
+
+
+class RegexCostTest(unittest.TestCase):
+    """The price of a search (regex_work, the port of window-ml's regexWork, src/readonly-exec/regex-cost.ts): input-aware,
+    read off sre's parse tree, its scans billed, and charged to the cell's budget before the search runs."""
+
+    FLAGS = {"i": 2, "m": 8, "s": 16, "x": 64}
+
+    def setUp(self):
+        import re
+        _restricted.allow_module("re", ["search", "findall", "compile", "sub", "subn"])
+        for name in ("search", "findall", "compile", "sub", "subn"):
+            _restricted.allow_call(getattr(re, name), True, restricted.regex_check(name))
+        _restricted.allow_call(len, False)
+        _restricted.allow_call(swallow, True)
+
+    def tearDown(self):
+        _restricted.reset()
+
+    def run_cell(self, src, budget=None):
+        return restricted.run_cell(src, {"swallow": swallow}, budget=budget)
+
+    # --- the bound ---
+
+    @unittest.skipIf(_cost_corpus() is None, "no window-ml regex-cost.json: set WML_DIALECT_VECTORS to its tests/fixtures/dialect-vectors")
+    def test_the_cost_corpus_orders(self):
+        corpus = _cost_corpus()
+        self.assertGreaterEqual(len(corpus), 20)
+        for v in corpus:
+            flags = sum(self.FLAGS[c] for c in v["flags"])
+            at = lambda k: restricted.regex_work(v["pattern"], flags, _regex_input(dict(v["input"], n=v["input"]["n"] * k)))
+            with self.subTest(v["name"]):
+                if v["order"] is None:
+                    self.assertEqual(at(1), float("inf"), v["reason"])
+                else:
+                    self.assertAlmostEqual(math.log2(at(2) / at(1)), v["order"], delta=0.1, msg=v["reason"])
+
+    def test_a_pattern_re_refuses_costs_nothing(self):
+        self.assertEqual(restricted.regex_work("(", 0, "a" * 1000), 0, "re raises its own error before any search")
+
+    def test_a_repeated_unit_that_branches_on_this_input_is_unbounded(self):
+        self.assertEqual(restricted.regex_work("(a+)+b", 0, "a" * 30), float("inf"))
+        self.assertLess(restricted.regex_work("(a+)+b", 0, "ab"), 100, "with no run to split, it cannot branch")
+
+    def test_anchored_starts_once(self):
+        s = "a" * 10000
+        self.assertLess(restricted.regex_work("a+b", 0, s, anchored=True), 5 * len(s))
+        self.assertGreater(restricted.regex_work("a+b", 0, s), len(s) ** 2)
+
+    def test_each_scan_is_charged_before_it_scans(self):
+        charged = []
+        restricted.regex_work("a+b+c+", 0, "a" * 100000, charged.append)
+        self.assertEqual(len(charged), 3, "one scan per distinct unit")
+        self.assertTrue(all(c >= 100000 // 256 for c in charged), charged)
+        scans = []
+
+        def out(n):
+            scans.append(n)
+            raise _restricted.NotInDialect("out of budget")
+        with self.assertRaises(_restricted.NotInDialect):
+            restricted.regex_work("a+b+c+", 0, "a" * 100000, out)
+        self.assertEqual(len(scans), 1, "the first charge stops it")
+
+    def test_findall_prices_each_match_it_can_return(self):
+        s = "word " * 1000
+        search = restricted.regex_work(r"\w+", 0, s)
+        findall = restricted.regex_work(r"\w+", 0, s, results=True)
+        self.assertEqual(findall - search, restricted._RESULT_UNITS * (len(s) + 1), "one possible match per start")
+        empty = restricted.regex_work("x*", 0, s, results=True) - restricted.regex_work("x*", 0, s)
+        self.assertEqual(empty, restricted._RESULT_UNITS * (len(s) + 1), "an empty match at every position")
+        wide = restricted.regex_work("word ", 0, s, results=True) - restricted.regex_work("word ", 0, s)
+        self.assertEqual(wide, restricted._RESULT_UNITS * 1000, "a first atom that matches 1000 times: 1000 starts")
+
+    # --- charge ---
+
+    def test_charge_outside_a_run_charges_nothing(self):
+        self.assertIsNone(_restricted.charge(10 ** 30))
+
+    def test_charge_refuses_a_negative_count(self):
+        with self.assertRaises(ValueError):
+            _restricted.charge(-1)
+
+    # --- the search, charged in a cell ---
+
+    def test_a_quadratic_search_is_refused_before_it_runs(self):
+        t = time.perf_counter()
+        with self.assertRaisesRegex(_restricted.NotInDialect, r"the step budget \(15000000\) ran out"):
+            self.run_cell("import re\nreturn re.search('a+b', 'a' * 300000)")
+        self.assertLess(time.perf_counter() - t, 1.0, "refused on its price, not after the search")
+        self.assertEqual(_restricted.steps(), restricted.DEFAULT_BUDGET + 1)
+
+    def test_sub_prices_its_input_not_its_replacement(self):
+        # sub and subn take the replacement second; pricing it ran re.sub('a+b', 'x', 'a' * 300000) for 20 s.
+        for name in ("sub", "subn"):
+            for call in (f"re.{name}('a+b', 'x', 'a' * 300000)", f"re.{name}('a+b', 'x', string='a' * 300000)"):
+                t = time.perf_counter()
+                with self.assertRaisesRegex(_restricted.NotInDialect, "step budget", msg=call):
+                    self.run_cell(f"import re\nreturn {call}")
+                self.assertLess(time.perf_counter() - t, 1.0, call)
+
+    def test_a_cheap_search_runs_and_its_price_is_spent(self):
+        self.assertEqual(self.run_cell("import re\nreturn len(re.findall('a+b', 'a' * 3000))"), 0)
+        price = restricted.regex_steps("a+b", 0, "a" * 3000)
+        self.assertGreaterEqual(_restricted.steps(), price)
+
+    def test_searches_draw_from_one_budget(self):
+        # Each search alone fits; together they do not. A cap per search could not see this.
+        one = restricted.regex_steps("a+b", 0, "a" * 2000)
+        src = "import re\nre.search('a+b', 'a' * 2000)\nre.search('a+b', 'a' * 2000)\nreturn 1"
+        with self.assertRaisesRegex(_restricted.NotInDialect, "step budget"):
+            self.run_cell(src, budget=int(one * 1.5))
+        self.assertEqual(self.run_cell(src, budget=one * 3), 1)
+
+    def test_compile_charges_nothing(self):
+        self.run_cell("import re\nre.compile('a+b')\nreturn 1", budget=1000)
+
+    def test_bytes_are_priced(self):
+        with self.assertRaisesRegex(_restricted.NotInDialect, "step budget"):
+            self.run_cell("import re\nreturn re.search(b'a+b', b'a' * 300000)")
+
+    def test_the_input_by_name_is_priced(self):
+        with self.assertRaisesRegex(_restricted.NotInDialect, "step budget"):
+            self.run_cell("import re\nreturn re.search('a+b', string='a' * 300000)")
+
+    def test_an_unpriceable_search_is_refused(self):
+        # Unreachable through the shape checks today (they refuse every repeat that can branch); held so a later
+        # widening of them cannot let an unbounded search run unpriced.
+        saved = restricted.regex_steps
+        restricted.regex_steps = lambda *a, **k: float("inf")
+        try:
+            with self.assertRaisesRegex(_restricted.NotInDialect, "has no price"):
+                restricted.regex_check("search")(None, None, ("a", "a"), {})
+        finally:
+            restricted.regex_steps = saved
+
+    def test_a_caught_charge_still_refuses_the_run(self):
+        # Host code that catches everything (pandas' fallbacks) calls the cell's lambda, which is gated again, so the
+        # search inside it is priced; the refusal it catches still refuses the run. (A lifted leaf is never handed
+        # re.search itself: entry_check admits only the program's own functions as callables.)
+        with self.assertRaisesRegex(_restricted.NotInDialect, "step budget|caught by library code"):
+            self.run_cell("import re\nreturn swallow(lambda: re.search('a+b', 'a' * 300000))")
+        self.assertEqual(_restricted.steps(), restricted.DEFAULT_BUDGET + 1, "the budget stays spent")
 
 
 class PrintTest(unittest.TestCase):

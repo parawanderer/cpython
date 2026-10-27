@@ -20,8 +20,8 @@ __all__ = ["compile_cell", "run_cell", "mark", "load_manifests", "allow_print", 
 
 CO_RESTRICTED = _restricted.CO_RESTRICTED
 # Steps a run gets when the caller names none. A step is one periodic check (a backward jump or a call), so it is far
-# coarser than the JS dialect's AST-node step; the number is calibrated to the same TIME, about a second of interpreter
-# work (Lib/test/test_restricted.py, BudgetTest, measures the rate on this build).
+# coarser than the JS dialect's AST-node step. On this core in Pyodide it is about 2 s of interpreter work (median
+# 7.1M steps/s), about twice the JS dialect's bound in time (Lib/test/test_restricted.py, BudgetTest, measures the rate).
 DEFAULT_BUDGET = _restricted.DEFAULT_BUDGET
 # Bytes a run may add to the heap, net: the native form of the JS dialect's size caps (MAX_STRING, MAX_COLLECTION).
 DEFAULT_MEMORY = _restricted.DEFAULT_MEMORY
@@ -435,6 +435,232 @@ def risky_parse(pattern, flags=0):
     return walk(tree)
 
 
+# The price of a search: sre is C with no match timeout, so a pattern the shape checks admit can still backtrack
+# polynomially in its INPUT (a+b over a run of "a" is quadratic) inside one call the step budget never sees. The checker
+# prices the search on the input it is about to run over and charges the steps before it runs (_restricted.charge).
+# The model is window-ml's regexWork (src/readonly-exec/regex-cost.ts), read off sre's own parse tree, as risky_parse
+# reads the shape; the rates are measured on this build in Pyodide (window-ml notebooks/python-dialect/regex-cost.ipynb).
+
+# Bound units (see regex_work) that cost one step. Measured in Pyodide on the fork core (window-ml
+# notebooks/python-dialect/regex-cost.ipynb): the slowest search is 6.3 ns a unit, net of what each match it returns
+# costs, and the fastest cell steps at 73 ns, so 11.6 units a step would hold a budget to its time; 8 leaves 1.45x.
+REGEX_UNITS_PER_STEP = 8
+# How much more a step of a COUNTED repeat ({m,n} with a finite n) costs than one of * or +. Measured: counted repeats
+# are at most 3.7 ns a unit with this weight, against 6.3 for the unbounded shapes, so it is not raised.
+_COUNTED_LOOP_WEIGHT = 3
+# Units each match a findall can return costs, beyond the search: sre restarts and builds the result per match. Net of
+# the search's own units, the notebook's rows need at most 190 ns a match (419 at the noisiest timing); 64 units is 8
+# steps, 587 ns at the fastest step.
+_RESULT_UNITS = 64
+# Characters of a run scan that cost one step: a scan reads each character against each of its atoms, a unit each.
+_SCAN_CHARS_PER_STEP = REGEX_UNITS_PER_STEP
+
+
+def regex_work(pattern, flags, string, charge=None, anchored=False, results=False):
+    """An upper bound, in units of about one backtracking step, on the work one sre search of ``pattern`` (str, with
+    ``flags``) does over ``string``: search or findall, which try each start once however many matches they find, or
+    with ``anchored`` (match, fullmatch) one start; with ``results`` (findall), each match it can return is priced too
+    (``_RESULT_UNITS``), at most one per start and one per shortest match. ``float('inf')`` when unbounded: an op this does not read, or a
+    repeated unit with more than one path on this input (the exponential shape the shape checks refuse first).
+
+    From one start, a node hands its continuation some number of PATHS (the ways it can end) and costs some WORK: in a
+    sequence an item runs once per path of everything before it, an alternation (and a conditional's two branches) is
+    the sum of its branches, a lookaround or an atomic group or a possessive repeat is one path, and a repeat of a
+    one-path unit has one path per iteration count it can stop at. That count is what makes the bound INPUT-AWARE: a
+    unit repeats only along a run of characters it matches, capped by the longest such run in ``string``, found by a
+    linear scan compiled from the unit's own atoms under the same flags. Starts are every position, or only those where
+    an unquantified first atom matches, or one after a leading \\A or ^ (one per line under MULTILINE).
+
+    ``charge`` is called with the steps each run scan costs BEFORE it scans, so the bound's own work is billed too."""
+    from re import _parser, _compiler, _constants as c
+    REPEATS = (c.MAX_REPEAT, c.MIN_REPEAT, c.POSSESSIVE_REPEAT)
+    CHARS = (c.LITERAL, c.NOT_LITERAL, c.ANY, c.IN, c.CATEGORY)
+    INF = float("inf")
+    try:
+        tree = _parser.parse(pattern, flags)
+    except Exception:
+        return 0                    # re itself refuses it, with its own error, before any search
+    flags = flags | tree.state.flags
+    n = len(string)
+
+    class Unread(Exception):
+        pass
+
+    def char_atoms(sub, out):
+        """The one-character atoms a subpattern can consume, or None when it holds a backreference (which can consume
+        anything) or a group that changes the flags its atoms are read under."""
+        for op, av in sub:
+            if op in CHARS:
+                out.append((op, av))
+            elif op is c.GROUPREF:
+                return None
+            elif op is c.BRANCH:
+                for b in av[1]:
+                    if char_atoms(b, out) is None:
+                        return None
+            elif op is c.SUBPATTERN:
+                if av[1] or av[2]:
+                    return None
+                if char_atoms(av[-1], out) is None:
+                    return None
+            elif op in REPEATS:
+                if char_atoms(av[2], out) is None:
+                    return None
+            elif op is c.ATOMIC_GROUP:
+                if char_atoms(av, out) is None:
+                    return None
+            elif op is c.GROUPREF_EXISTS:
+                for b in (av[1], av[2]):
+                    if b is not None and char_atoms(b, out) is None:
+                        return None
+            elif op not in (c.AT, c.ASSERT, c.ASSERT_NOT):
+                raise Unread(op)
+        return out
+
+    def scan(atoms):
+        """A search for the runs of ``atoms``, which never backtracks: a possessive repeat with nothing after it."""
+        if charge is not None:
+            charge(-(-n * max(1, len(atoms)) // _SCAN_CHARS_PER_STEP))
+        state = _parser.State()
+        state.flags = flags
+        body = [(c.BRANCH, (None, [_parser.SubPattern(state, [a]) for a in atoms]))] if len(atoms) > 1 else list(atoms)
+        rep = _parser.SubPattern(state, [(c.POSSESSIVE_REPEAT, (1, c.MAXREPEAT, _parser.SubPattern(state, body)))])
+        return _compiler.compile(rep, flags)
+
+    runs = {}
+
+    def longest_run(atoms):
+        if atoms is None:
+            return n
+        if not atoms or not n:
+            return 0
+        key = repr(atoms)
+        if key not in runs:
+            runs[key] = max((m.end() - m.start() for m in scan(atoms).finditer(string)), default=0)
+        return runs[key]
+
+    def widest(sub):
+        """The longest a subpattern can match, for what a backreference compares."""
+        w = 0
+        for op, av in sub:
+            if op in CHARS:
+                w += 1
+            elif op is c.GROUPREF:
+                w += n
+            elif op is c.BRANCH:
+                w += max(map(widest, av[1]))
+            elif op is c.GROUPREF_EXISTS:
+                w += max(widest(av[1]), widest(av[2]) if av[2] is not None else 0)
+            elif op is c.SUBPATTERN:
+                w += widest(av[-1])
+            elif op is c.ATOMIC_GROUP:
+                w += widest(av)
+            elif op in REPEATS:
+                lo, hi, body = av
+                if hi:
+                    reps = 1 if hi == 1 else min(hi, longest_run(char_atoms(body, [])))
+                    w += reps * widest(body)
+            w = min(w, n)
+        return w
+
+    def captures(sub, out):
+        for op, av in sub:
+            if op is c.SUBPATTERN:
+                if av[0] is not None:
+                    out.append(av[-1])
+                captures(av[-1], out)
+            elif op is c.BRANCH:
+                for b in av[1]:
+                    captures(b, out)
+            elif op in REPEATS:
+                captures(av[2], out)
+            elif op is c.ATOMIC_GROUP:
+                captures(av, out)
+            elif op in (c.ASSERT, c.ASSERT_NOT):
+                captures(av[1], out)
+            elif op is c.GROUPREF_EXISTS:
+                for b in (av[1], av[2]):
+                    if b is not None:
+                        captures(b, out)
+        return out
+
+    backref = []
+
+    def seq(sub):
+        paths, work = 1, 0
+        for op, av in sub:
+            p, w = node(op, av)
+            work += paths * w
+            paths *= p
+        return paths, work
+
+    def node(op, av):
+        if op in CHARS or op is c.AT:
+            return 1, 1
+        if op is c.BRANCH:
+            costs = [seq(b) for b in av[1]]
+            return sum(p for p, _ in costs), sum(w for _, w in costs)
+        if op is c.GROUPREF_EXISTS:
+            yes, no = seq(av[1]), seq(av[2]) if av[2] is not None else (1, 1)
+            return yes[0] + no[0], yes[1] + no[1]
+        if op is c.SUBPATTERN:
+            return seq(av[-1])
+        if op in (c.ASSERT, c.ASSERT_NOT):
+            return 1, seq(av[1])[1]
+        if op is c.ATOMIC_GROUP:
+            return 1, seq(av)[1]
+        if op is c.GROUPREF:
+            if not backref:
+                backref.append(1 + max([0] + [widest(s) for s in captures(tree, [])]))
+            return 1, backref[0]
+        if op in REPEATS:
+            lo, hi, body = av
+            if hi == 0:
+                return 1, 1
+            paths, work = seq(body)
+            if hi == 1:
+                out = 1 if op is c.POSSESSIVE_REPEAT else (1 if lo == 0 else 0) + paths
+                return out, work + 1
+            if paths != 1:
+                return INF, INF
+            reps = min(hi, longest_run(char_atoms(body, [])))
+            choices = max(1, reps - lo + 1)
+            own = max(reps, lo) * work + choices
+            if hi != c.MAXREPEAT:
+                own *= _COUNTED_LOOP_WEIGHT
+            return (1 if op is c.POSSESSIVE_REPEAT else choices), own
+        raise Unread(op)
+
+    try:
+        per_start = seq(tree)[1]
+        if per_start == INF:
+            return INF
+        first = tree[0] if len(tree) else None
+        if anchored:
+            starts = 1
+        elif first is not None and first[0] is c.AT and first[1] is c.AT_BEGINNING_STRING:
+            starts = 1
+        elif first is not None and first[0] is c.AT and first[1] is c.AT_BEGINNING:
+            starts = 1 + string.count("\n") if flags & c.SRE_FLAG_MULTILINE else 1
+        elif first is not None and first[0] in CHARS and n:
+            starts = sum(m.end() - m.start() for m in scan([first]).finditer(string))
+        else:
+            starts = n + 1
+    except Unread:
+        return INF
+    work = n + starts * per_start
+    if results:
+        shortest = tree.getwidth()[0]
+        work += _RESULT_UNITS * min(starts, n // shortest + 1 if shortest else n + 1)
+    return work
+
+
+def regex_steps(pattern, flags, string, charge=None, anchored=False, results=False):
+    """regex_work in steps, rounded up; ``float('inf')`` when unbounded."""
+    work = regex_work(pattern, flags, string, charge, anchored, results)
+    return work if work == float("inf") else -(-work // REGEX_UNITS_PER_STEP)
+
+
 # re's functions: lifted leaves (sre is C; re's own Python resolves nothing from its arguments) behind a check that the
 # pattern cannot backtrack exponentially, and the callback rule for a callable `repl`.
 _REGEX = ("compile", "search", "match", "fullmatch", "findall", "finditer", "sub", "subn", "split")
@@ -453,9 +679,22 @@ def regex_check(name):
         at = {"compile": 1, "search": 2, "match": 2, "fullmatch": 2, "findall": 2, "finditer": 2, "split": 3,
               "sub": 4, "subn": 4}[name]
         flags = args[at] if len(args) > at else (kwargs or {}).get("flags", 0)
-        why = risky_regex(pattern) or risky_parse(pattern, flags if isinstance(flags, int) else 0)
+        flags = flags if isinstance(flags, int) else 0
+        why = risky_regex(pattern) or risky_parse(pattern, flags)
         if why:
             raise NotInDialect(f"not in dialect: re.{name}({pattern!r}) could backtrack exponentially ({why})")
+        # The search's price, charged before it runs, the scans first; compile has no input and charges nothing.
+        # The input: after the replacement for sub and subn, else right after the pattern.
+        at = 2 if name in ("sub", "subn") else 1
+        string = args[at] if len(args) > at else (kwargs or {}).get("string")
+        if name != "compile" and isinstance(string, (str, bytes)):
+            if isinstance(string, bytes):
+                string = string.decode("latin-1")
+            steps = regex_steps(pattern, flags, string, _restricted.charge, anchored=name in ("match", "fullmatch"),
+                                results=name in ("findall", "finditer", "split", "sub", "subn"))
+            if steps == float("inf"):
+                raise NotInDialect(f"not in dialect: re.{name}({pattern!r}) has no price on this input")
+            _restricted.charge(steps)
         arguments(func, self, args, kwargs)
     return check
 

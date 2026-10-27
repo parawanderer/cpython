@@ -600,6 +600,17 @@ _PyRestricted_Reset(void)
    library `except Exception` that swallowed one refusal meets the next at its own next loop or call. The DEPTH is
    judged only at a CO_RESTRICTED frame (a program's own def or lambda), counted in Python frames above where the run
    began, so a lifted leaf's internals may nest as CPython allows while the program's recursion is bounded. */
+/* The budget is spent: it stays exhausted (and cannot wrap), the run trips, NotInDialect is set. */
+static int
+out_of_steps(_PyThreadStateImpl *ts)
+{
+    ts->restricted_steps = -1;
+    trip();
+    PyErr_Format(not_in_dialect ? not_in_dialect : PyExc_PermissionError,
+                 "not in dialect: the step budget (%lld) ran out", ts->restricted_budget);
+    return -1;
+}
+
 int
 _PyRestricted_Tick(PyThreadState *tstate)
 {
@@ -611,10 +622,7 @@ _PyRestricted_Tick(PyThreadState *tstate)
         return -1;
     }
     if (--ts->restricted_steps < 0) {
-        ts->restricted_steps = -1;      /* stays exhausted, and cannot wrap */
-        trip();
-        PyErr_Format(exc, "not in dialect: the step budget (%lld) ran out", ts->restricted_budget);
-        return -1;
+        return out_of_steps(ts);
     }
     _PyInterpreterFrame *f = tstate->current_frame;
     if (f != NULL && f->owner != FRAME_OWNED_BY_INTERPRETER) {
@@ -628,6 +636,23 @@ _PyRestricted_Tick(PyThreadState *tstate)
             }
         }
     }
+    return 0;
+}
+
+/* Charge `n` steps at once for work the periodic check cannot see: a C loop a lifted leaf's checker priced before it
+   runs (a regex search over its input). It draws from the same budget and trips exactly as a tick that ran out does,
+   before any of the work happens. Outside a run there is no budget, and nothing is charged. */
+int
+_PyRestricted_Charge(PyThreadState *tstate, long long n)
+{
+    _PyThreadStateImpl *ts = (_PyThreadStateImpl *)tstate;
+    if (!_PyRestricted_InRun(tstate) || n <= 0) {
+        return 0;
+    }
+    if (n > ts->restricted_steps) {
+        return out_of_steps(ts);
+    }
+    ts->restricted_steps -= n;
     return 0;
 }
 

@@ -106,6 +106,9 @@ extern PyObject *_PyRestricted_Call(PyThreadState *tstate, PyObject *callable, P
 /* The step budget and the depth, charged at every periodic check while _PY_EVAL_RESTRICTED_BIT is set (the extent of
    _restricted.run()). Returns 0, or -1 with NotInDialect set. */
 extern int _PyRestricted_Tick(PyThreadState *tstate);
+/* Charge n steps of priced C work at once (a lifted leaf's checker, before the leaf runs): 0, or -1 with NotInDialect
+   set when the budget cannot cover it, tripping as _PyRestricted_Tick does. Nothing outside a run. */
+PyAPI_FUNC(int) _PyRestricted_Charge(PyThreadState *tstate, long long n);
 
 /* What crosses into a lifted extent other than through a leaf's checker: item keys and values under "[]^", and a
    lifted dunder's operands. And whether a kind's Python dunders run lifted ("__^"). */
