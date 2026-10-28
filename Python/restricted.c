@@ -40,6 +40,7 @@ static PyObject *fresh;           // set: lifted callables (or a method's functi
 static PyObject *snapshots;       // dict: type -> (snapshot, restore): the undo log for kinds CPython cannot copy
 
 static int is_owned(PyObject *obj);
+static void owned_forget(void);
 int _PyRestricted_WriteBarrier(PyObject *obj);
 int _PyRestricted_MemoryTripped(void);
 static void mark_fresh(PyObject *callable, PyObject *result, PyObject *const *args, Py_ssize_t nargs, PyObject *self);
@@ -590,6 +591,7 @@ _PyRestricted_Reset(void)
     Py_CLEAR(fresh);
     Py_CLEAR(snapshots);
     Py_CLEAR(dynamic);
+    owned_forget();
 }
 
 /* --- the step budget and the depth (Python/ceval_gil.c calls this from _Py_HandlePending) --- */
@@ -787,6 +789,18 @@ static int
 is_owned(PyObject *obj)
 {
     return owned != NULL && _Py_hashtable_get(owned, obj) != NULL;
+}
+
+/* reset() ends every ownership: it is the host's run boundary, and a value an earlier run made and left reachable (a
+   default argument, a module global, a closure cell) must not stay writable in the next. Within a run, one cell's
+   values stay the next cell's own: each cell is its own _restricted.run, so the set is not cleared per run. The lifted
+   generators stay: that table says who wrote a generator, not who may write a value. */
+static void
+owned_forget(void)
+{
+    if (owned != NULL) {
+        _Py_hashtable_clear(owned);
+    }
 }
 
 /* Called by _restricted.run() before a run: install the tracer, or forget every ownership if ours was replaced. */
