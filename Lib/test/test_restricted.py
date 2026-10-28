@@ -7,6 +7,7 @@ tests/fixtures/dialect-vectors/) are the acceptance suite once the gate exists.
 
 import gc
 import math
+import sys
 import sysconfig
 import time
 import types
@@ -821,6 +822,95 @@ class AddressReuseTest(unittest.TestCase):
         for i in range(20):
             self.run_cell("t = [i]\ng = plain_gen()\ndel t, g\nreturn 1", {"i": i})
         self.assertEqual(_restricted._table_sizes(), before)
+
+
+class ResetOwnershipTest(unittest.TestCase):
+    """reset() is the host's run boundary, and every ownership ends there (window-ml #1102). Within a run each cell is
+    its own _restricted.run and the namespace is kept, so a value one cell made is the next cell's own; after reset()
+    the same value, reached through a library default, a module global or a closure cell, is read-only. Libraries are
+    loaded under the gate, as window-ml's libraryLoad does, so what their module level makes is owned."""
+
+    LIBRARIES = {
+        "_reset_default": "def keep(x, acc=[]):\n    acc.append(x)\n    return acc\n",
+        "_reset_global": "CACHE = []\ndef keep(x):\n    CACHE.append(x)\n    return CACHE\n",
+        "_reset_make": "def make():\n    acc = []\n    def keep(x):\n        acc.append(x)\n        return acc\n"
+                       "    return keep\n",
+    }
+    SHAPES = {
+        "a library's default argument": "import _reset_default\nkeep = _reset_default.keep\nreturn keep(1)",
+        "a library's module global": "import _reset_global\nkeep = _reset_global.keep\nreturn keep(1)",
+        "a cell-defined closure": "def make():\n    acc = []\n    def keep(x):\n        acc.append(x)\n"
+                                  "        return acc\n    return keep\nkeep = make()\nreturn keep(1)",
+        "a library's returned closure": "import _reset_make\nkeep = _reset_make.make()\nreturn keep(1)",
+    }
+
+    def setUp(self):
+        self.reset()
+
+    def load(self):
+        """Run each library's body under the gate, so what its module level makes is owned by this run."""
+        for name, src in self.LIBRARIES.items():
+            mod = types.ModuleType(name)
+            _restricted.run(restricted.mark(compile(src, "<library %s>" % name, "exec")), mod.__dict__)
+            sys.modules[name] = mod
+
+    def tearDown(self):
+        _restricted.reset()
+        for name in self.LIBRARIES:
+            sys.modules.pop(name, None)
+
+    def tables(self):
+        _restricted.allow_kind(list, ["append", "[]"])
+        for t, names in restricted.MUTATORS.items():
+            _restricted.allow_mutators(t, names)
+        _restricted.allow_call(plain_gen, True)
+        for name in self.LIBRARIES:
+            _restricted.allow_module(name, ["keep", "make"])
+
+    def reset(self):
+        _restricted.reset()
+        self.tables()
+
+    def refused(self, src, ns):
+        with self.assertRaisesRegex(_restricted.NotInDialect, "does not own", msg=src):
+            restricted.run_cell(src, ns)
+
+    def test_each_shape_persists_within_the_run_and_is_read_only_after_reset(self):
+        for shape, src in self.SHAPES.items():
+            with self.subTest(shape):
+                self.reset()
+                self.load()
+                ns = {}
+                self.assertEqual(restricted.run_cell(src, ns), [1])
+                kept = restricted.run_cell("return keep(2)", ns)
+                self.assertEqual(kept, [1, 2])
+                self.reset()
+                self.refused("return keep(3)", ns)
+                self.assertEqual(kept, [1, 2])
+
+    def test_a_closure_made_outside_a_run_is_read_only_before_and_after_reset(self):
+        acc = []
+        def keep(x):
+            acc.append(x)
+            return acc
+        ns = {"keep": keep}
+        self.refused("return keep(1)", ns)
+        self.reset()
+        self.refused("return keep(1)", ns)
+        self.assertEqual(acc, [])
+
+    def test_a_cells_list_is_not_owned_after_reset(self):
+        xs = restricted.run_cell("return [1]", {})
+        self.assertTrue(_restricted.owned(xs))
+        _restricted.reset()
+        self.assertFalse(_restricted.owned(xs))
+
+    def test_reset_keeps_the_lifted_generators(self):
+        ns = {"plain_gen": plain_gen}
+        restricted.run_cell("g = plain_gen()", ns)
+        lifted = _restricted._table_sizes()[1]
+        self.reset()
+        self.assertEqual(_restricted._table_sizes()[1], lifted)
 
 
 class MemoryTest(unittest.TestCase):

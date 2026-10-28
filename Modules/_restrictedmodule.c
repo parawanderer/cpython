@@ -455,7 +455,7 @@ restricted_allow_dynamic(PyObject *module, PyObject *const *args, Py_ssize_t nar
     Py_RETURN_NONE;
 }
 
-/* reset(): forget every allow table (tests). */
+/* reset(): forget every allow table and every ownership (the host's run boundary, and tests). */
 static PyObject *
 restricted_reset(PyObject *module, PyObject *Py_UNUSED(ignored))
 {
@@ -473,7 +473,7 @@ static PyMethodDef restricted_methods[] = {
     {"allow_dynamic", _PyCFunction_CAST(restricted_allow_dynamic), METH_FASTCALL,
      "allow_dynamic(type, predicate, /)\n--\n\nAdmit names outside type's table when predicate(obj, name) is true."},
     {"reset", restricted_reset, METH_NOARGS,
-     "reset()\n--\n\nForget every allow table."},
+     "reset()\n--\n\nForget every allow table and every ownership."},
     {"run", _PyCFunction_CAST(restricted_run), METH_FASTCALL,
      "run(code, globals, budget=None, depth=None, memory=None, /)\n--\n\nEvaluate a CO_RESTRICTED code object with the thread restricted, metered by\na step budget, bounded in depth and capped in memory."},
     {"allow_mutators", _PyCFunction_CAST(restricted_allow_mutators), METH_FASTCALL,
