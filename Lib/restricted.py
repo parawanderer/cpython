@@ -20,8 +20,9 @@ __all__ = ["compile_cell", "run_cell", "mark", "load_manifests", "allow_print", 
 
 CO_RESTRICTED = _restricted.CO_RESTRICTED
 # Steps a run gets when the caller names none. A step is one periodic check (a backward jump or a call), so it is far
-# coarser than the JS dialect's AST-node step. On this core in Pyodide it is about 2 s of interpreter work (median
-# 7.1M steps/s), about twice the JS dialect's bound in time (Lib/test/test_restricted.py, BudgetTest, measures the rate).
+# coarser than the JS dialect's AST-node step. On this core in Pyodide it is about 1.6 to 2.1 s of interpreter work
+# depending on load (9.35M steps/s quiet, 7.07M loaded), about twice the JS dialect's bound in time
+# (Lib/test/test_restricted.py, BudgetTest, measures the rate).
 DEFAULT_BUDGET = _restricted.DEFAULT_BUDGET
 # Bytes a run may add to the heap, net: the native form of the JS dialect's size caps (MAX_STRING, MAX_COLLECTION).
 DEFAULT_MEMORY = _restricted.DEFAULT_MEMORY
